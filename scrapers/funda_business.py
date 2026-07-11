@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from urllib.parse import urlparse
-
 from bs4 import BeautifulSoup
 
 from .base import (
@@ -17,8 +15,8 @@ from .base import (
 )
 
 
-class GenericScraper(BaseScraper):
-    source_name = "generic"
+class FundaBusinessScraper(BaseScraper):
+    source_name = "funda_business"
 
     def parse_public_html(self, url: str, html: str) -> ScrapeResult:
         soup = BeautifulSoup(html, "html.parser")
@@ -29,54 +27,36 @@ class GenericScraper(BaseScraper):
             title = " ".join(soup.title.string.split())
 
         description = extract_meta_content(soup, "og:description") or extract_meta_content(soup, "description")
+
         address = parse_address_from_jsonld(find_first_jsonld_value(blocks, ["address"]))
 
         price_raw = find_first_jsonld_value(blocks, ["price", "offers", "priceSpecification"])
         if isinstance(price_raw, dict):
             price_raw = price_raw.get("price") or price_raw.get("minPrice")
+
         asking_price, price_status = parse_price(price_raw)
         if price_status is None:
             asking_price, price_status = parse_price(description)
 
-        living_area = parse_area_sqm(find_first_jsonld_value(blocks, ["floorSize", "livingArea", "size"]))
+        living_area = parse_area_sqm(find_first_jsonld_value(blocks, ["floorSize", "floorSizeValue", "size"]))
         plot_area = parse_area_sqm(find_first_jsonld_value(blocks, ["lotSize", "plotArea"]))
-
         object_type = find_first_jsonld_value(blocks, ["@type", "additionalType", "propertyType"])
         if isinstance(object_type, list):
             object_type = object_type[0] if object_type else None
         if not isinstance(object_type, str):
             object_type = None
 
-        features: list[str] = []
-        for item in soup.select("li"):
-            text = " ".join(item.get_text(separator=" ", strip=True).split())
-            if len(text) >= 8:
-                features.append(text)
-            if len(features) >= 10:
-                break
-
-        images: list[str] = []
-        og_image = extract_meta_content(soup, "og:image")
-        if og_image:
-            images.append(og_image)
-
-        image_candidate = find_first_jsonld_value(blocks, ["image", "photos"])
-        if isinstance(image_candidate, str):
-            images.append(image_candidate)
-        elif isinstance(image_candidate, list):
-            for item in image_candidate:
-                if isinstance(item, str):
-                    images.append(item)
-
         raw_text = extract_visible_text(soup)
 
         warnings: list[str] = []
-        if not raw_text:
-            warnings.append("Geen zichtbare tekst gevonden op de pagina.")
+        if not raw_text or len(raw_text.split()) < 35:
+            warnings.append("Onvoldoende publiek leesbare inhoud op de Funda in Business-pagina.")
         if not title:
-            warnings.append("Geen titel gevonden in title/OG metadata.")
+            warnings.append("Titel ontbreekt in publiek beschikbare metadata.")
+        if not address:
+            warnings.append("Adres ontbreekt in publiek beschikbare metadata.")
 
-        success = bool(raw_text)
+        success = bool(raw_text and len(raw_text.split()) >= 35 and (title or address))
 
         return ScrapeResult(
             source_name=self.source_name,
@@ -90,23 +70,10 @@ class GenericScraper(BaseScraper):
             plot_area=plot_area,
             object_type=object_type,
             description=description,
-            features=features,
-            images=list(dict.fromkeys(images)),
+            features=[],
+            images=[],
             raw_text=raw_text[:15000] if raw_text else None,
             warnings=warnings,
-            extraction_method="public_html_title_meta_og_jsonld_text",
-            confidence=0.70 if success else 0.25,
+            extraction_method="public_html_meta_jsonld",
+            confidence=0.72 if success else 0.32,
         )
-
-
-def fetch_page_text(url: str) -> str:
-    if not url or not url.strip():
-        raise ValueError("Geef een URL op.")
-
-    parsed = urlparse(url.strip())
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("Gebruik een geldige http(s)-URL.")
-
-    scraper = GenericScraper()
-    result = scraper.scrape(url.strip())
-    return result.raw_text or ""

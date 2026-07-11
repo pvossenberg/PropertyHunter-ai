@@ -7,7 +7,8 @@ from ai.analyzer import analyze_property
 from models.permit import PermitRecord
 from models.property import Property
 from models.transaction import PropertyTransaction
-from scrapers.generic import fetch_page_text
+from scrapers.base import ScrapeResult
+from scrapers.router import scrape_url
 from services.calculations import calculate_days_on_market, calculate_price_change_since_last_transaction, calculate_price_per_m2, calculate_price_reduction
 
 
@@ -281,6 +282,52 @@ def _render_analysis_result(source_url: str, analysis: dict):
         _render_list(analysis.get("next_actions"))
 
 
+def _compose_source_text(result: ScrapeResult) -> str:
+    chunks: list[str] = []
+    for value in (result.title, result.address, result.description, result.raw_text):
+        if isinstance(value, str) and value.strip():
+            chunks.append(value.strip())
+    if result.features:
+        chunks.extend([item.strip() for item in result.features if isinstance(item, str) and item.strip()])
+    merged = "\n".join(chunks)
+    return " ".join(merged.split())
+
+
+def _has_sufficient_source_text(text: str, min_words: int = 40) -> bool:
+    return isinstance(text, str) and len(text.split()) >= min_words
+
+
+def _render_funda_failure_ui(result: ScrapeResult):
+    st.error("Deze Funda-pagina kon niet volledig worden uitgelezen.")
+    if result.warnings:
+        for warning in result.warnings:
+            st.warning(warning)
+
+    fallback = result.fallback_recommendation or {}
+    suggestion = fallback.get("broker_search_query")
+    if suggestion:
+        st.info(f"Voorgestelde zoekopdracht voor makelaarssite: {suggestion}")
+
+    st.text_area(
+        "Plak de advertentietekst",
+        height=220,
+        placeholder="Plak hier de volledige advertentietekst van de listing.",
+        key="funda_fallback_text",
+    )
+    st.text_input(
+        "Voer het adres handmatig in",
+        placeholder="Bijv. Voorbeeldstraat 12, Amsterdam",
+        key="funda_manual_address",
+    )
+    st.text_input(
+        "Plak de URL van de verkopende makelaar",
+        placeholder="https://www.makelaar.nl/object/...",
+        key="funda_broker_url",
+    )
+    if st.button("Opnieuw proberen", key="retry_funda", type="secondary"):
+        st.rerun()
+
+
 def main():
     st.set_page_config(page_title="PropertyHunter AI", page_icon="🏠", layout="centered")
     st.title("PropertyHunter AI")
@@ -297,10 +344,7 @@ def main():
             else:
                 with st.spinner("De pagina wordt opgehaald en geanalyseerd..."):
                     try:
-                        property_text = fetch_page_text(url)
-                        if len(property_text.split()) < 40:
-                            st.warning("De opgehaalde tekst is erg kort. Plaats de advertentietekst handmatig als de website weinig inhoud toont.")
-                        analysis = analyze_property(property_text)
+                        scrape_result = scrape_url(url.strip())
                     except ValueError as error:
                         st.error(str(error))
                     except requests.RequestException as error:
@@ -310,7 +354,18 @@ def main():
                     except Exception as error:
                         st.error(f"Er ging iets mis tijdens de analyse: {error}")
                     else:
-                        _render_analysis_result(url.strip(), analysis)
+                        if not scrape_result.success and scrape_result.source_name in {"funda", "funda_business"}:
+                            _render_funda_failure_ui(scrape_result)
+                        else:
+                            property_text = _compose_source_text(scrape_result)
+                            if not _has_sufficient_source_text(property_text):
+                                st.warning(
+                                    "Er is onvoldoende brontekst beschikbaar voor een betrouwbare AI-analyse. "
+                                    "Plak de advertentietekst handmatig in het teksttabblad."
+                                )
+                            else:
+                                analysis = analyze_property(property_text)
+                                _render_analysis_result(url.strip(), analysis)
 
     with tab_text:
         manual_text = st.text_area("Vastgoedadvertentie", height=280, placeholder="Plak hier de volledige advertentietekst van het object.", key="manual_input")
