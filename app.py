@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime
+import logging
 
 import streamlit as st
 import requests
 
 from ai.analyzer import analyze_property
+from deal_finder.orchestrator import DealFinderOrchestrator
 from models.permit import PermitRecord
 from models.property import Property
 from models.transaction import PropertyTransaction
@@ -16,6 +18,18 @@ from services.database import DatabaseService
 
 
 DATABASE_SERVICE = DatabaseService.from_env()
+DEAL_FINDER_ORCHESTRATOR = DealFinderOrchestrator(DATABASE_SERVICE)
+LOGGER = logging.getLogger(__name__)
+
+
+def _run_url_import(urls_text: str, orchestrator: DealFinderOrchestrator | None = None) -> dict:
+    active_orchestrator = orchestrator or DEAL_FINDER_ORCHESTRATOR
+    try:
+        result = active_orchestrator.import_urls(urls_text)
+    except Exception as error:
+        LOGGER.exception("Deal Finder URL import failed: %s", type(error).__name__)
+        return {"ok": False, "error": f"{type(error).__name__}: {error}", "result": None}
+    return {"ok": True, "error": None, "result": result}
 
 
 def _format_currency(value):
@@ -39,6 +53,35 @@ def _format_number(value):
         return "Onbekend"
     integer_value = int(round(number))
     return f"{integer_value:,}".replace(",", ".")
+
+
+def _to_display_text(value) -> str:
+    if value in (None, ""):
+        return ""
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value)
+    if isinstance(value, dict):
+        return str(value)
+    return str(value)
+
+
+def _render_rows_with_columns(rows: list[dict], columns: list[tuple[str, str]], empty_message: str):
+    if not rows:
+        st.info(empty_message)
+        return
+
+    header_columns = st.columns(len(columns))
+    for index, (label, _) in enumerate(columns):
+        header_columns[index].markdown(f"**{label}**")
+
+    for row in rows:
+        value_columns = st.columns(len(columns))
+        for index, (_, key) in enumerate(columns):
+            value_columns[index].write(_to_display_text(row.get(key)))
+
+
+def _deal_finder_marker(message: str):
+    LOGGER.warning("[DEAL_FINDER_MARKER] %s", message)
 
 
 def _format_asking_price(status: str, price, text: str | None = None) -> str:
@@ -212,17 +255,26 @@ def _render_analysis_result(source_url: str, analysis: dict):
 
     with st.expander("Vorige transacties"):
         if property_data.previous_transactions:
-            st.dataframe(
-                [
-                    {
-                        "Datum": transaction.transaction_date,
-                        "Type": transaction.transaction_type,
-                        "Prijs": _format_currency(transaction.transaction_price) if transaction.transaction_price is not None else "Onbekend",
-                        "Bron": transaction.source or "Onbekend",
-                        "Betrouwbaarheid": transaction.confidence,
-                    }
-                    for transaction in property_data.previous_transactions
-                ]
+            transaction_rows = [
+                {
+                    "date": transaction.transaction_date,
+                    "type": transaction.transaction_type,
+                    "price": _format_currency(transaction.transaction_price) if transaction.transaction_price is not None else "Onbekend",
+                    "source": transaction.source or "Onbekend",
+                    "confidence": transaction.confidence,
+                }
+                for transaction in property_data.previous_transactions
+            ]
+            _render_rows_with_columns(
+                rows=transaction_rows,
+                columns=[
+                    ("Datum", "date"),
+                    ("Type", "type"),
+                    ("Prijs", "price"),
+                    ("Bron", "source"),
+                    ("Betrouwbaarheid", "confidence"),
+                ],
+                empty_message="Geen vorige transacties bekend.",
             )
 
             last_known_transaction = None
@@ -244,21 +296,34 @@ def _render_analysis_result(source_url: str, analysis: dict):
 
     with st.expander("Vergunningen afgelopen tien jaar"):
         if property_data.permits_last_10_years:
-            st.dataframe(
-                [
-                    {
-                        "Aanvraagdatum": permit.application_date,
-                        "Type": permit.permit_type or "Onbekend",
-                        "Omschrijving": permit.description or "Onbekend",
-                        "Status": _permit_status_label(permit.status),
-                        "Besluitdatum": permit.decision_date,
-                        "Instantie": permit.authority or "Onbekend",
-                        "Relevantie": permit.investment_relevance or "Onbekend",
-                        "Bron": permit.source or "Onbekend",
-                        "Bronlink": permit.source_url or "",
-                    }
-                    for permit in property_data.permits_last_10_years
-                ]
+            permit_rows = [
+                {
+                    "application_date": permit.application_date,
+                    "type": permit.permit_type or "Onbekend",
+                    "description": permit.description or "Onbekend",
+                    "status": _permit_status_label(permit.status),
+                    "decision_date": permit.decision_date,
+                    "authority": permit.authority or "Onbekend",
+                    "relevance": permit.investment_relevance or "Onbekend",
+                    "source": permit.source or "Onbekend",
+                    "source_url": permit.source_url or "",
+                }
+                for permit in property_data.permits_last_10_years
+            ]
+            _render_rows_with_columns(
+                rows=permit_rows,
+                columns=[
+                    ("Aanvraagdatum", "application_date"),
+                    ("Type", "type"),
+                    ("Omschrijving", "description"),
+                    ("Status", "status"),
+                    ("Besluitdatum", "decision_date"),
+                    ("Instantie", "authority"),
+                    ("Relevantie", "relevance"),
+                    ("Bron", "source"),
+                    ("Bronlink", "source_url"),
+                ],
+                empty_message="Geen vergunningen bekend.",
             )
         else:
             st.write("Geen vergunningen bekend.")
@@ -554,21 +619,32 @@ def _render_my_analyses_page():
         st.info("Geen analyses gevonden voor de gekozen filters.")
         return
 
-    st.dataframe(
-        [
-            {
-                "Investment score": _safe_score(item.get("investment_score")),
-                "Titel": item.get("title") or "Onbekend",
-                "Adres": item.get("address") or "Onbekend",
-                "Stad": item.get("city") or "Onbekend",
-                "Vraagprijs": _format_currency(item.get("asking_price")),
-                "Prijs per m²": _format_number(item.get("price_per_m2")),
-                "Aangemaakt": item.get("created_at") or "Onbekend",
-                "Bron": item.get("source_url") or "",
-            }
-            for item in rows
+    analysis_rows = [
+        {
+            "investment_score": _safe_score(item.get("investment_score")),
+            "title": item.get("title") or "Onbekend",
+            "address": item.get("address") or "Onbekend",
+            "city": item.get("city") or "Onbekend",
+            "asking_price": _format_currency(item.get("asking_price")),
+            "price_per_m2": _format_number(item.get("price_per_m2")),
+            "created_at": item.get("created_at") or "Onbekend",
+            "source_url": item.get("source_url") or "",
+        }
+        for item in rows
+    ]
+    _render_rows_with_columns(
+        rows=analysis_rows,
+        columns=[
+            ("Investment score", "investment_score"),
+            ("Titel", "title"),
+            ("Adres", "address"),
+            ("Stad", "city"),
+            ("Vraagprijs", "asking_price"),
+            ("Prijs per m²", "price_per_m2"),
+            ("Aangemaakt", "created_at"),
+            ("Bron", "source_url"),
         ],
-        use_container_width=True,
+        empty_message="Geen analyses gevonden voor de gekozen filters.",
     )
 
     selected = st.selectbox(
@@ -669,19 +745,317 @@ def _render_dashboard_page():
         st.info("Nog geen recente analyses beschikbaar.")
 
 
+def _render_deal_finder_page():
+    _deal_finder_marker("page_start")
+    st.subheader("Deal Finder")
+
+    if not DATABASE_SERVICE.is_enabled:
+        st.info("Supabase is niet geconfigureerd. Stel SUPABASE_URL en SUPABASE_SERVICE_ROLE_KEY in om Deal Finder te gebruiken.")
+        return
+
+    st.caption("Foundationversie: ingestie, deduplicatie, snapshots en rules-based ranking zonder live scraping bypasses.")
+
+    col_seed, col_refresh = st.columns([1, 1])
+    with col_seed:
+        if st.button("Seed brondefinities", key="seed_sources", type="secondary"):
+            _deal_finder_marker("seed_sources_start")
+            seeded = DEAL_FINDER_ORCHESTRATOR.seed_default_sources()
+            st.success(f"{len(seeded)} brondefinities upserted.")
+            _deal_finder_marker("seed_sources_done")
+    with col_refresh:
+        if st.button("Vernieuwen", key="refresh_deal_finder", type="secondary"):
+            st.rerun()
+
+    health = DATABASE_SERVICE.get_source_health()
+    _deal_finder_marker("source_health_loaded")
+    source_rows = health.get("sources") or []
+    latest_runs = health.get("latest_scan_runs") or []
+
+    st.markdown("### Source status")
+    _deal_finder_marker("source_status_render_start")
+    if source_rows:
+        source_table_rows = [
+            {
+                "name": row.get("name") or "Onbekend",
+                "type": row.get("source_type") or "unknown",
+                "enabled": bool(row.get("is_enabled")),
+                "latest_status": row.get("latest_scan_status") or "n.v.t.",
+                "last_success": row.get("last_successful_scan_at") or "n.v.t.",
+                "latest_error": row.get("latest_scan_error") or row.get("last_error") or "",
+            }
+            for row in source_rows
+        ]
+        _render_rows_with_columns(
+            rows=source_table_rows,
+            columns=[
+                ("Bron", "name"),
+                ("Type", "type"),
+                ("Enabled", "enabled"),
+                ("Laatste status", "latest_status"),
+                ("Laatste succesvolle scan", "last_success"),
+                ("Laatste fout", "latest_error"),
+            ],
+            empty_message="Nog geen bronnen beschikbaar. Gebruik 'Seed brondefinities'.",
+        )
+    else:
+        st.info("Nog geen bronnen beschikbaar. Gebruik 'Seed brondefinities'.")
+    _deal_finder_marker("source_status_render_done")
+
+    st.markdown("### Latest scan runs")
+    _deal_finder_marker("latest_scan_runs_render_start")
+    if latest_runs:
+        latest_run_rows = [
+            {
+                "source_id": run.get("source_id") or "",
+                "status": run.get("status") or "",
+                "started_at": run.get("started_at") or "",
+                "completed_at": run.get("completed_at") or "",
+                "found": run.get("items_found") or 0,
+                "new": run.get("items_new") or 0,
+                "changed": run.get("items_changed") or 0,
+                "error": run.get("error_message") or "",
+            }
+            for run in latest_runs[:20]
+        ]
+        _render_rows_with_columns(
+            rows=latest_run_rows,
+            columns=[
+                ("Bron ID", "source_id"),
+                ("Status", "status"),
+                ("Gestart", "started_at"),
+                ("Voltooid", "completed_at"),
+                ("Found", "found"),
+                ("Nieuw", "new"),
+                ("Gewijzigd", "changed"),
+                ("Fout", "error"),
+            ],
+            empty_message="Nog geen scan runs.",
+        )
+    else:
+        st.info("Nog geen scan runs.")
+    _deal_finder_marker("latest_scan_runs_render_done")
+
+    st.markdown("### Handmatige import")
+    _deal_finder_marker("manual_import_section_start")
+    csv_file = st.file_uploader("Upload CSV", type=["csv"], key="deal_csv_upload")
+    if csv_file is not None and st.button("Importeer CSV", key="import_csv"):
+        csv_text = csv_file.getvalue().decode("utf-8", errors="ignore")
+        result = DEAL_FINDER_ORCHESTRATOR.import_csv(csv_text)
+        st.success(f"CSV verwerkt: found={result['found']} new={result['new']} changed={result['changed']}")
+        if result.get("warnings"):
+            for warning in result["warnings"]:
+                st.warning(warning)
+
+    json_file = st.file_uploader("Upload JSON", type=["json"], key="deal_json_upload")
+    if json_file is not None and st.button("Importeer JSON", key="import_json"):
+        json_text = json_file.getvalue().decode("utf-8", errors="ignore")
+        result = DEAL_FINDER_ORCHESTRATOR.import_json(json_text)
+        st.success(f"JSON verwerkt: found={result['found']} new={result['new']} changed={result['changed']}")
+        if result.get("warnings"):
+            for warning in result["warnings"]:
+                st.warning(warning)
+
+    urls_text = st.text_area("Plak listing-URL's (1 per regel)", key="deal_urls_input", height=120)
+    if st.button("Importeer URL's", key="import_urls"):
+        _deal_finder_marker("url_import_start")
+        outcome = _run_url_import(urls_text)
+        if not outcome["ok"]:
+            st.error(f"URL import mislukt: {outcome['error']}")
+            st.session_state["deal_last_url_import"] = {
+                "status": "error",
+                "error": outcome["error"],
+            }
+        else:
+            result = outcome["result"] or {}
+            st.success(f"URL import verwerkt: found={result['found']} new={result['new']} changed={result['changed']}")
+            if result.get("warnings"):
+                for warning in result["warnings"]:
+                    st.warning(warning)
+            st.session_state["deal_last_url_import"] = {
+                "status": "ok",
+                "found": result.get("found") or 0,
+                "new": result.get("new") or 0,
+                "changed": result.get("changed") or 0,
+                "warnings": result.get("warnings") or [],
+                "listing_ids": result.get("listing_ids") or [],
+            }
+        _deal_finder_marker("url_import_done")
+
+    last_url_import = st.session_state.get("deal_last_url_import")
+    if isinstance(last_url_import, dict):
+        st.markdown("#### Laatste URL import resultaat")
+        if last_url_import.get("status") == "error":
+            st.error(f"Status: error | {last_url_import.get('error') or 'Onbekende fout'}")
+        else:
+            url_result_rows = [
+                {
+                    "found": last_url_import.get("found") or 0,
+                    "new": last_url_import.get("new") or 0,
+                    "changed": last_url_import.get("changed") or 0,
+                    "listing_ids": ", ".join(last_url_import.get("listing_ids") or []),
+                }
+            ]
+            _render_rows_with_columns(
+                rows=url_result_rows,
+                columns=[
+                    ("Found", "found"),
+                    ("New", "new"),
+                    ("Changed", "changed"),
+                    ("Listing IDs", "listing_ids"),
+                ],
+                empty_message="Geen URL importresultaat beschikbaar.",
+            )
+            warnings = last_url_import.get("warnings") or []
+            for warning in warnings:
+                st.warning(warning)
+    _deal_finder_marker("manual_import_section_done")
+
+    st.markdown("### New deal candidates")
+    _deal_finder_marker("deal_candidates_section_start")
+    source_options = {"Alle bronnen": None}
+    for source in source_rows:
+        if source.get("id"):
+            source_options[str(source.get("name") or source.get("id"))] = str(source.get("id"))
+
+    city_values = sorted({(item.get("city") or "").strip() for item in DATABASE_SERVICE.list_raw_listings(limit=5000) if isinstance(item.get("city"), str) and item.get("city").strip()})
+
+    col_a, col_b, col_c, col_d = st.columns(4)
+    with col_a:
+        city_filter = st.selectbox("Stad", ["Alle steden", *city_values], key="deal_city_filter")
+    with col_b:
+        source_label = st.selectbox("Bron", list(source_options.keys()), key="deal_source_filter")
+    with col_c:
+        min_score = st.slider("Minimum score", min_value=0, max_value=100, value=0, key="deal_min_score")
+    with col_d:
+        priority_filter = st.selectbox("Priority", ["alle", "low", "medium", "high", "urgent"], key="deal_priority_filter")
+
+    sort_choice = st.selectbox("Sortering", ["Nieuwste", "Hoogste score", "Laagste vraagprijs", "Hoogste vraagprijs"], key="deal_sort")
+    sort_map = {
+        "Nieuwste": "detected_at_desc",
+        "Hoogste score": "score_desc",
+        "Laagste vraagprijs": "asking_price_asc",
+        "Hoogste vraagprijs": "asking_price_desc",
+    }
+
+    candidates = DATABASE_SERVICE.list_deal_candidates(
+        limit=500,
+        city=None if city_filter == "Alle steden" else city_filter,
+        source_id=source_options.get(source_label),
+        minimum_score=min_score,
+        priority=None if priority_filter == "alle" else priority_filter,
+        sort_by=sort_map.get(sort_choice, "detected_at_desc"),
+    )
+
+    if not candidates:
+        st.info("Geen deal candidates gevonden voor de gekozen filters.")
+        _deal_finder_marker("deal_candidates_section_done_empty")
+        return
+
+    candidate_rows = [
+        {
+            "candidate_id": item.get("id"),
+            "score": item.get("score"),
+            "priority": item.get("priority"),
+            "title": (item.get("listing") or {}).get("title") or "Onbekend",
+            "address": (item.get("listing") or {}).get("address") or "Onbekend",
+            "city": (item.get("listing") or {}).get("city") or "Onbekend",
+            "asking_price": _format_currency((item.get("listing") or {}).get("asking_price")),
+            "source": (item.get("source") or {}).get("name") or "Onbekend",
+            "detected": item.get("detected_at") or "",
+            "review_status": item.get("review_status") or "new",
+        }
+        for item in candidates
+    ]
+    _render_rows_with_columns(
+        rows=candidate_rows,
+        columns=[
+            ("Candidate ID", "candidate_id"),
+            ("Score", "score"),
+            ("Priority", "priority"),
+            ("Titel", "title"),
+            ("Adres", "address"),
+            ("Stad", "city"),
+            ("Vraagprijs", "asking_price"),
+            ("Bron", "source"),
+            ("Detected", "detected"),
+            ("Review status", "review_status"),
+        ],
+        empty_message="Geen deal candidates gevonden voor de gekozen filters.",
+    )
+
+    selected_candidate = st.selectbox(
+        "Selecteer listing",
+        candidates,
+        key="deal_candidate_select",
+        format_func=lambda item: f"{(item.get('listing') or {}).get('title') or 'Onbekend'} | score {item.get('score') if item.get('score') is not None else 'n.v.t.'} | {item.get('priority') or 'n.v.t.'}",
+    )
+
+    listing = (selected_candidate or {}).get("listing") or {}
+    listing_id = listing.get("id")
+    if not listing_id:
+        return
+
+    detail = DATABASE_SERVICE.get_listing_detail(str(listing_id))
+    listing_detail = detail.get("listing") or {}
+    latest_snapshot = detail.get("latest_snapshot") or {}
+    source_detail = detail.get("source") or {}
+    candidate_detail = detail.get("candidate") or {}
+
+    st.markdown("### Geselecteerde listing details")
+    _deal_finder_marker("selected_listing_details_start")
+    st.write(f"Titel: {listing_detail.get('title') or 'Onbekend'}")
+    st.write(f"Adres: {listing_detail.get('address') or 'Onbekend'}")
+    st.write(f"Stad: {listing_detail.get('city') or 'Onbekend'}")
+    st.write(f"Vraagprijs: {_format_currency(listing_detail.get('asking_price'))}")
+    st.write(f"Status: {listing_detail.get('listing_status') or 'Onbekend'}")
+    st.write(f"Bron: {source_detail.get('name') or 'Onbekend'}")
+    st.write(f"Priority: {candidate_detail.get('priority') or 'Onbekend'}")
+    st.write(f"Reason codes: {', '.join(candidate_detail.get('reasons') or []) or 'Geen'}")
+    if listing_detail.get("source_url"):
+        st.link_button("Open listing", listing_detail.get("source_url"))
+
+    col_review, col_analyze = st.columns(2)
+    with col_review:
+        if st.button("Markeer reviewed", key="mark_candidate_reviewed"):
+            candidate_id = selected_candidate.get("id") if isinstance(selected_candidate, dict) else None
+            if candidate_id:
+                DATABASE_SERVICE.mark_candidate_reviewed(str(candidate_id), review_status="reviewed")
+                st.success("Candidate gemarkeerd als reviewed.")
+
+    with col_analyze:
+        if st.button("Analyseer geselecteerde listing", key="analyze_selected_listing"):
+            description = latest_snapshot.get("description") or listing_detail.get("title") or ""
+            source_text = " ".join([str(listing_detail.get("title") or ""), str(listing_detail.get("address") or ""), str(description or "")]).strip()
+            if len(source_text.split()) < 5:
+                st.warning("Onvoldoende tekst beschikbaar om deze listing te analyseren.")
+            else:
+                try:
+                    analysis = analyze_property(source_text)
+                except Exception as error:
+                    st.error(f"Analyse mislukt: {error}")
+                else:
+                    _persist_analysis_result(str(listing_detail.get("source_url") or ""), analysis)
+                    _render_analysis_result(str(listing_detail.get("source_url") or ""), analysis)
+    _deal_finder_marker("selected_listing_details_done")
+    _deal_finder_marker("deal_candidates_section_done")
+    _deal_finder_marker("page_done")
+
+
 def main():
     st.set_page_config(page_title="PropertyHunter AI", page_icon="🏠", layout="centered")
     st.title("PropertyHunter AI")
     with st.sidebar:
         st.markdown("## Navigatie")
-        page = st.radio("Kies een onderdeel", ["Nieuwe analyse", "Mijn analyses", "Dashboard"], index=0)
+        page = st.radio("Kies een onderdeel", ["Nieuwe analyse", "Mijn analyses", "Dashboard", "Deal Finder"], index=0)
 
     if page == "Nieuwe analyse":
         _render_new_analysis_page()
     elif page == "Mijn analyses":
         _render_my_analyses_page()
-    else:
+    elif page == "Dashboard":
         _render_dashboard_page()
+    else:
+        _render_deal_finder_page()
 
 
 if __name__ == "__main__":

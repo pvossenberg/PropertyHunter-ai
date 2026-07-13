@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
+import json
 from typing import Any
 
 from config import SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
@@ -36,6 +39,32 @@ def _as_int(value: Any) -> int | None:
         return int(float(value))
     except (TypeError, ValueError):
         return None
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_source_url(url: str | None) -> str:
+    if not isinstance(url, str):
+        return ""
+    trimmed = url.strip().lower()
+    while trimmed.endswith("/"):
+        trimmed = trimmed[:-1]
+    return trimmed
+
+
+def _hash_snapshot_content(snapshot: dict[str, Any]) -> str:
+    payload = {
+        "asking_price": snapshot.get("asking_price"),
+        "listing_status": snapshot.get("listing_status"),
+        "title": snapshot.get("title"),
+        "description": snapshot.get("description"),
+        "surface_m2": snapshot.get("surface_m2"),
+        "features": snapshot.get("features") or {},
+    }
+    normalized = json.dumps(payload, sort_keys=True, ensure_ascii=True, default=str)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 @dataclass
@@ -84,6 +113,54 @@ class DatabaseService:
             return [item for item in response.data if isinstance(item, dict)]
         except Exception:
             return []
+
+    def _insert_row(self, table_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.is_enabled:
+            return {}
+        client = self._client
+        if client is None:
+            return {}
+        try:
+            response = client.table(table_name).insert(payload).execute()
+            if response and response.data:
+                first = response.data[0]
+                return first if isinstance(first, dict) else {}
+        except Exception:
+            return {}
+        return {}
+
+    def _update_row(self, table_name: str, row_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.is_enabled:
+            return {}
+        client = self._client
+        if client is None:
+            return {}
+        try:
+            response = client.table(table_name).update(payload).eq("id", row_id).execute()
+            if response and response.data:
+                first = response.data[0]
+                return first if isinstance(first, dict) else {}
+        except Exception:
+            return {}
+        return {}
+
+    def _upsert_rows(self, table_name: str, payload: dict[str, Any], on_conflict: str) -> dict[str, Any]:
+        if not self.is_enabled:
+            return {}
+        client = self._client
+        if client is None:
+            return {}
+        try:
+            response = client.table(table_name).upsert(payload, on_conflict=on_conflict).execute()
+            if response and response.data:
+                first = response.data[0]
+                return first if isinstance(first, dict) else {}
+        except Exception:
+            return {}
+        return {}
+
+    def list_raw_listings(self, limit: int = 5000) -> list[dict[str, Any]]:
+        return self._fetch_rows("listings", limit=max(1, int(limit or 5000)))
 
     def list_properties(self, limit: int = 100, city: str | None = None) -> list[dict[str, Any]]:
         normalized_limit = max(1, int(limit or 100))
@@ -202,6 +279,330 @@ class DatabaseService:
             "properties_by_city": city_counts,
             "top_properties": top_properties,
             "recent_properties": recent_properties,
+        }
+
+    def upsert_listing_source(
+        self,
+        *,
+        name: str,
+        source_type: str,
+        base_url: str | None,
+        is_enabled: bool = False,
+        scan_frequency_minutes: int | None = None,
+        configuration: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(name, str) or not name.strip():
+            return {}
+        payload = {
+            "name": name.strip(),
+            "source_type": source_type or "unknown",
+            "base_url": base_url,
+            "is_enabled": bool(is_enabled),
+            "scan_frequency_minutes": scan_frequency_minutes,
+            "configuration": configuration or {},
+            "updated_at": _utc_now_iso(),
+        }
+        row = self._upsert_rows("listing_sources", payload, on_conflict="name")
+        if row:
+            return row
+        rows = self._fetch_rows("listing_sources", filters={"name": name.strip()}, limit=1)
+        return rows[0] if rows else {}
+
+    def create_scan_run(self, source_id: str | None, status: str = "running", metadata: dict[str, Any] | None = None) -> str | None:
+        payload = {
+            "source_id": source_id,
+            "started_at": _utc_now_iso(),
+            "status": status,
+            "metadata": metadata or {},
+        }
+        row = self._insert_row("scan_runs", payload)
+        scan_id = row.get("id") if row else None
+        return str(scan_id) if scan_id else None
+
+    def complete_scan_run(
+        self,
+        *,
+        scan_run_id: str | None,
+        status: str,
+        items_found: int,
+        items_new: int,
+        items_changed: int,
+        error_message: str | None,
+        metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if not scan_run_id:
+            return {}
+        payload = {
+            "completed_at": _utc_now_iso(),
+            "status": status,
+            "items_found": max(0, int(items_found or 0)),
+            "items_new": max(0, int(items_new or 0)),
+            "items_changed": max(0, int(items_changed or 0)),
+            "error_message": error_message,
+            "metadata": metadata or {},
+        }
+        return self._update_row("scan_runs", scan_run_id, payload)
+
+    def upsert_listing(
+        self,
+        *,
+        source_id: str | None,
+        external_listing_id: str | None,
+        source_url: str,
+        title: str | None,
+        address: str | None,
+        city: str | None,
+        asking_price: float | None,
+        surface_m2: float | None,
+        property_type: str | None,
+        listing_status: str | None,
+        raw_payload: dict[str, Any] | None,
+        dedupe_match: Any = None,
+    ) -> dict[str, Any]:
+        if not isinstance(source_url, str) or not source_url.strip():
+            return {}
+
+        now_iso = _utc_now_iso()
+        normalized_url = _normalize_source_url(source_url)
+        payload = {
+            "property_id": getattr(dedupe_match, "matched_property_id", None),
+            "source_id": source_id,
+            "external_listing_id": external_listing_id,
+            "source_url": source_url.strip(),
+            "title": title,
+            "address": address,
+            "city": city,
+            "asking_price": asking_price,
+            "surface_m2": surface_m2,
+            "property_type": property_type,
+            "listing_status": listing_status or "active",
+            "last_seen_at": now_iso,
+            "is_active": (listing_status or "active") == "active",
+            "raw_payload": raw_payload or {},
+            "updated_at": now_iso,
+        }
+
+        if source_id and external_listing_id:
+            row = self._upsert_rows("listings", payload, on_conflict="source_id,external_listing_id")
+            if row:
+                return row
+
+        existing_rows = self._fetch_rows("listings", limit=5000)
+        for row in existing_rows:
+            row_url = _normalize_source_url(row.get("source_url"))
+            if normalized_url and normalized_url == row_url:
+                row_id = row.get("id")
+                if row_id:
+                    updated = self._update_row("listings", str(row_id), payload)
+                    return updated or row
+
+        payload["first_seen_at"] = now_iso
+        return self._insert_row("listings", payload)
+
+    def add_listing_snapshot_if_changed(self, *, listing_id: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(listing_id, str) or not listing_id.strip():
+            return {"changed": False, "change_type": "invalid_listing_id", "snapshot_id": None}
+
+        current_hash = _hash_snapshot_content(snapshot)
+        previous = self._fetch_rows("listing_snapshots", filters={"listing_id": listing_id}, limit=1)
+        previous_row = previous[0] if previous else {}
+        previous_hash = previous_row.get("content_hash") if previous_row else None
+
+        if previous_hash and previous_hash == current_hash:
+            return {"changed": False, "change_type": "unchanged", "snapshot_id": previous_row.get("id")}
+
+        change_type = "new_listing"
+        if previous_row:
+            old_price = _as_float(previous_row.get("asking_price"))
+            new_price = _as_float(snapshot.get("asking_price"))
+            old_status = str(previous_row.get("listing_status") or "")
+            new_status = str(snapshot.get("listing_status") or "")
+            old_desc = str(previous_row.get("description") or "")
+            new_desc = str(snapshot.get("description") or "")
+
+            if old_status and old_status != "active" and new_status == "active":
+                change_type = "relisting_signal"
+            elif old_price != new_price:
+                change_type = "asking_price_change"
+            elif old_status != new_status:
+                change_type = "listing_status_change"
+            elif old_desc != new_desc:
+                change_type = "description_change"
+            else:
+                change_type = "content_change"
+
+        payload = {
+            "listing_id": listing_id,
+            "observed_at": _utc_now_iso(),
+            "asking_price": snapshot.get("asking_price"),
+            "listing_status": snapshot.get("listing_status") or "active",
+            "title": snapshot.get("title"),
+            "description": snapshot.get("description"),
+            "surface_m2": snapshot.get("surface_m2"),
+            "features": snapshot.get("features") or {},
+            "content_hash": current_hash,
+            "raw_payload": snapshot.get("raw_payload") or {},
+        }
+        inserted = self._insert_row("listing_snapshots", payload)
+
+        self._update_row(
+            "listings",
+            listing_id,
+            {
+                "last_seen_at": _utc_now_iso(),
+                "listing_status": payload["listing_status"],
+                "asking_price": payload["asking_price"],
+                "title": payload["title"],
+                "surface_m2": payload["surface_m2"],
+                "is_active": payload["listing_status"] == "active",
+                "updated_at": _utc_now_iso(),
+            },
+        )
+
+        return {"changed": True, "change_type": change_type, "snapshot_id": inserted.get("id") if inserted else None}
+
+    def create_or_update_deal_candidate(
+        self,
+        *,
+        listing_id: str,
+        property_id: str | None,
+        investment_score: int | None,
+        hidden_value_score: int | None,
+        priority: str,
+        reasons: list[str] | None,
+        review_status: str = "new",
+    ) -> dict[str, Any]:
+        existing = self._fetch_rows("deal_candidates", filters={"listing_id": listing_id}, limit=1)
+        payload = {
+            "listing_id": listing_id,
+            "property_id": property_id,
+            "investment_score": investment_score,
+            "hidden_value_score": hidden_value_score,
+            "priority": priority,
+            "reasons": reasons or [],
+            "review_status": review_status,
+            "detected_at": _utc_now_iso(),
+        }
+        if existing:
+            row_id = existing[0].get("id")
+            if row_id:
+                return self._update_row("deal_candidates", str(row_id), payload)
+        return self._insert_row("deal_candidates", payload)
+
+    def list_deal_candidates(
+        self,
+        *,
+        limit: int = 200,
+        city: str | None = None,
+        source_id: str | None = None,
+        minimum_score: int | None = None,
+        priority: str | None = None,
+        sort_by: str = "detected_at_desc",
+    ) -> list[dict[str, Any]]:
+        candidates = self._fetch_rows("deal_candidates", limit=max(1, int(limit or 200)))
+        if not candidates:
+            return []
+
+        listings = {str(item.get("id")): item for item in self._fetch_rows("listings", limit=5000) if item.get("id")}
+        sources = {str(item.get("id")): item for item in self._fetch_rows("listing_sources", limit=1000) if item.get("id")}
+
+        rows: list[dict[str, Any]] = []
+        for candidate in candidates:
+            listing_id = str(candidate.get("listing_id") or "")
+            listing = listings.get(listing_id, {})
+            source = sources.get(str(listing.get("source_id") or ""), {})
+            hidden_score = _as_int(candidate.get("hidden_value_score"))
+            if minimum_score is not None and hidden_score is not None and hidden_score < int(minimum_score):
+                continue
+            if city and (listing.get("city") or "") != city:
+                continue
+            if source_id and str(listing.get("source_id") or "") != source_id:
+                continue
+            if priority and (candidate.get("priority") or "") != priority:
+                continue
+
+            rows.append(
+                {
+                    **candidate,
+                    "listing": listing,
+                    "source": source,
+                    "score": hidden_score,
+                }
+            )
+
+        if sort_by == "score_desc":
+            rows.sort(key=lambda item: _as_int(item.get("score")) or -1, reverse=True)
+        elif sort_by == "asking_price_asc":
+            rows.sort(key=lambda item: _as_float((item.get("listing") or {}).get("asking_price")) if _as_float((item.get("listing") or {}).get("asking_price")) is not None else float("inf"))
+        elif sort_by == "asking_price_desc":
+            rows.sort(key=lambda item: _as_float((item.get("listing") or {}).get("asking_price")) or -1, reverse=True)
+        else:
+            rows.sort(key=lambda item: str(item.get("detected_at") or ""), reverse=True)
+
+        return rows[: max(1, int(limit or 200))]
+
+    def get_listing_detail(self, listing_id: str) -> dict[str, Any]:
+        if not isinstance(listing_id, str) or not listing_id.strip():
+            return {"listing": {}, "source": {}, "snapshots": [], "latest_snapshot": {}, "candidate": {}}
+
+        listing_rows = self._fetch_rows("listings", filters={"id": listing_id.strip()}, limit=1)
+        listing = listing_rows[0] if listing_rows else {}
+        source_id = listing.get("source_id") if listing else None
+        source_rows = self._fetch_rows("listing_sources", filters={"id": source_id}, limit=1) if source_id else []
+        source = source_rows[0] if source_rows else {}
+        snapshots = self._fetch_rows("listing_snapshots", filters={"listing_id": listing_id.strip()}, limit=50)
+        latest_snapshot = snapshots[0] if snapshots else {}
+        candidates = self._fetch_rows("deal_candidates", filters={"listing_id": listing_id.strip()}, limit=1)
+
+        return {
+            "listing": listing,
+            "source": source,
+            "snapshots": snapshots,
+            "latest_snapshot": latest_snapshot,
+            "candidate": candidates[0] if candidates else {},
+        }
+
+    def mark_candidate_reviewed(self, candidate_id: str, review_status: str = "reviewed") -> dict[str, Any]:
+        if not isinstance(candidate_id, str) or not candidate_id.strip():
+            return {}
+        return self._update_row(
+            "deal_candidates",
+            candidate_id.strip(),
+            {
+                "review_status": review_status,
+                "reviewed_at": _utc_now_iso(),
+            },
+        )
+
+    def get_source_health(self) -> dict[str, Any]:
+        sources = self._fetch_rows("listing_sources", limit=200)
+        scan_runs = self._fetch_rows("scan_runs", limit=500)
+
+        latest_scan_by_source: dict[str, dict[str, Any]] = {}
+        for run in scan_runs:
+            source_id = str(run.get("source_id") or "")
+            if not source_id:
+                continue
+            if source_id not in latest_scan_by_source:
+                latest_scan_by_source[source_id] = run
+
+        source_rows: list[dict[str, Any]] = []
+        for source in sources:
+            source_id = str(source.get("id") or "")
+            latest_scan = latest_scan_by_source.get(source_id, {})
+            source_rows.append(
+                {
+                    **source,
+                    "latest_scan_status": latest_scan.get("status"),
+                    "latest_scan_started_at": latest_scan.get("started_at"),
+                    "latest_scan_completed_at": latest_scan.get("completed_at"),
+                    "latest_scan_error": latest_scan.get("error_message"),
+                }
+            )
+
+        return {
+            "sources": source_rows,
+            "latest_scan_runs": scan_runs[:20],
         }
 
     def store_analyzed_property(self, source_url: str, analysis: dict[str, Any]) -> str | None:
