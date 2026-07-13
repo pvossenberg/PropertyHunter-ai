@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 import streamlit as st
 import requests
 
@@ -10,6 +12,10 @@ from models.transaction import PropertyTransaction
 from scrapers.base import ScrapeResult
 from scrapers.router import scrape_url
 from services.calculations import calculate_days_on_market, calculate_price_change_since_last_transaction, calculate_price_per_m2, calculate_price_reduction
+from services.database import DatabaseService
+
+
+DATABASE_SERVICE = DatabaseService.from_env()
 
 
 def _format_currency(value):
@@ -328,10 +334,136 @@ def _render_funda_failure_ui(result: ScrapeResult):
         st.rerun()
 
 
-def main():
-    st.set_page_config(page_title="PropertyHunter AI", page_icon="🏠", layout="centered")
-    st.title("PropertyHunter AI")
+def _persist_analysis_result(source_url: str, analysis: dict):
+    if not isinstance(analysis, dict) or not DATABASE_SERVICE.is_enabled:
+        return
 
+    try:
+        DATABASE_SERVICE.store_analyzed_property(source_url=source_url, analysis=analysis)
+    except Exception as error:
+        st.warning(f"Analyse kon niet naar Supabase worden opgeslagen: {error}")
+
+
+def _safe_score(value) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_number(value) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_datetime(value) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        return datetime.min
+    normalized = value.strip().replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return datetime.min
+
+
+def _filter_and_sort_properties(
+    properties: list[dict],
+    *,
+    city_filter: str,
+    min_investment_score: int,
+    max_asking_price: float | None,
+    search_query: str,
+    sort_option: str,
+) -> list[dict]:
+    filtered: list[dict] = []
+    needle = (search_query or "").strip().lower()
+
+    for item in properties:
+        city_value = (item.get("city") or "").strip()
+        score = _safe_score(item.get("investment_score"))
+        asking_price = _safe_number(item.get("asking_price"))
+        title = str(item.get("title") or "")
+        address = str(item.get("address") or "")
+
+        if city_filter != "Alle steden" and city_value != city_filter:
+            continue
+        if score is None or score < min_investment_score:
+            continue
+        if max_asking_price is not None and asking_price is not None and asking_price > max_asking_price:
+            continue
+        if needle and needle not in title.lower() and needle not in address.lower():
+            continue
+        filtered.append(item)
+
+    if sort_option == "Hoogste score":
+        filtered.sort(key=lambda item: _safe_score(item.get("investment_score")) or -1, reverse=True)
+    elif sort_option == "Nieuwste eerst":
+        filtered.sort(key=lambda item: _parse_datetime(item.get("created_at")), reverse=True)
+    elif sort_option == "Laagste vraagprijs":
+        filtered.sort(key=lambda item: _safe_number(item.get("asking_price")) if _safe_number(item.get("asking_price")) is not None else float("inf"))
+    elif sort_option == "Hoogste vraagprijs":
+        filtered.sort(key=lambda item: _safe_number(item.get("asking_price")) or -1, reverse=True)
+
+    return filtered
+
+
+def _build_selected_analysis(property_data: dict, analysis_data: dict) -> dict:
+    extracted = {
+        "source_url": property_data.get("source_url"),
+        "title": property_data.get("title"),
+        "address": property_data.get("address"),
+        "city": property_data.get("city"),
+        "country": property_data.get("country"),
+        "asking_price": property_data.get("asking_price"),
+        "asking_price_status": property_data.get("asking_price_status") or "unknown",
+        "asking_price_text": property_data.get("asking_price_text"),
+        "listed_since": property_data.get("listed_since"),
+        "days_on_market": property_data.get("days_on_market"),
+        "listing_status": property_data.get("listing_status") or "unknown",
+        "original_asking_price": property_data.get("original_asking_price"),
+        "current_asking_price": property_data.get("current_asking_price"),
+        "price_reduction_count": property_data.get("price_reduction_count") or 0,
+        "last_price_reduction_date": property_data.get("last_price_reduction_date"),
+        "total_price_reduction_amount": property_data.get("total_price_reduction_amount"),
+        "total_price_reduction_percentage": property_data.get("total_price_reduction_percentage"),
+        "listing_history_source": property_data.get("listing_history_source"),
+        "listing_history_confidence": property_data.get("listing_history_confidence") or "unknown",
+        "surface_m2": property_data.get("surface_m2"),
+        "price_per_m2": property_data.get("price_per_m2"),
+        "annual_rent": property_data.get("annual_rent"),
+        "property_type": property_data.get("property_type"),
+        "current_use": property_data.get("current_use"),
+        "zoning": property_data.get("zoning"),
+        "energy_label": property_data.get("energy_label"),
+        "description": property_data.get("description"),
+        "previous_transactions": [],
+        "permits_last_10_years": [],
+        "active_permits": [],
+    }
+
+    return {
+        "property_summary": analysis_data.get("property_summary"),
+        "extracted_data": extracted,
+        "investment_score": analysis_data.get("investment_score") or 0,
+        "score_breakdown": analysis_data.get("score_breakdown") or {},
+        "analysis_confidence_score": analysis_data.get("analysis_confidence_score") or 0,
+        "data_quality_warnings": analysis_data.get("data_quality_warnings") or [],
+        "strengths": analysis_data.get("strengths") or [],
+        "risks": analysis_data.get("risks") or [],
+        "missing_information": analysis_data.get("missing_information") or [],
+        "assumptions": analysis_data.get("assumptions") or [],
+        "recommendation": analysis_data.get("recommendation"),
+        "next_actions": analysis_data.get("next_actions") or [],
+    }
+
+
+def _render_new_analysis_page():
     st.caption("Analyseer vastgoedobjecten met een URL of handmatig geplakte advertentietekst.")
 
     tab_url, tab_text = st.tabs(["Analyse via URL", "Tekst handmatig invoeren"])
@@ -365,6 +497,7 @@ def main():
                                 )
                             else:
                                 analysis = analyze_property(property_text)
+                                _persist_analysis_result(url.strip(), analysis)
                                 _render_analysis_result(url.strip(), analysis)
 
     with tab_text:
@@ -383,7 +516,172 @@ def main():
                     except Exception as error:
                         st.error(f"Er ging iets mis tijdens de analyse: {error}")
                     else:
+                        _persist_analysis_result("", analysis)
                         _render_analysis_result("", analysis)
+
+
+def _render_my_analyses_page():
+    st.subheader("Mijn analyses")
+
+    if not DATABASE_SERVICE.is_enabled:
+        st.info("Supabase is nog niet geconfigureerd. Vul SUPABASE_URL en SUPABASE_SERVICE_ROLE_KEY in .env in.")
+        return
+
+    all_properties = DATABASE_SERVICE.list_properties(limit=500)
+    if not all_properties:
+        st.info("Er zijn nog geen opgeslagen analyses.")
+        return
+
+    city_options = sorted({(item.get("city") or "").strip() for item in all_properties if isinstance(item.get("city"), str) and item.get("city").strip()})
+    city_filter = st.selectbox("Stad", ["Alle steden", *city_options], index=0)
+
+    min_score = st.slider("Minimum investment score", min_value=0, max_value=100, value=0, step=1)
+    max_price_input = st.number_input("Maximum vraagprijs (0 = geen limiet)", min_value=0.0, value=0.0, step=10000.0)
+    max_price = max_price_input if max_price_input > 0 else None
+    search_query = st.text_input("Zoek op titel of adres")
+    sort_option = st.selectbox("Sortering", ["Hoogste score", "Nieuwste eerst", "Laagste vraagprijs", "Hoogste vraagprijs"], index=0)
+
+    rows = _filter_and_sort_properties(
+        all_properties,
+        city_filter=city_filter,
+        min_investment_score=min_score,
+        max_asking_price=max_price,
+        search_query=search_query,
+        sort_option=sort_option,
+    )
+
+    if not rows:
+        st.info("Geen analyses gevonden voor de gekozen filters.")
+        return
+
+    st.dataframe(
+        [
+            {
+                "Investment score": _safe_score(item.get("investment_score")),
+                "Titel": item.get("title") or "Onbekend",
+                "Adres": item.get("address") or "Onbekend",
+                "Stad": item.get("city") or "Onbekend",
+                "Vraagprijs": _format_currency(item.get("asking_price")),
+                "Prijs per m²": _format_number(item.get("price_per_m2")),
+                "Aangemaakt": item.get("created_at") or "Onbekend",
+                "Bron": item.get("source_url") or "",
+            }
+            for item in rows
+        ],
+        use_container_width=True,
+    )
+
+    selected = st.selectbox(
+        "Selecteer een property",
+        rows,
+        format_func=lambda item: f"{item.get('title') or 'Onbekend'} | {item.get('address') or 'Onbekend'} | score {item.get('investment_score') if item.get('investment_score') is not None else 'n.v.t.'}",
+    )
+    selected_id = selected.get("id") if isinstance(selected, dict) else None
+    if not selected_id:
+        return
+
+    detail = DATABASE_SERVICE.get_property_with_latest_analysis(str(selected_id))
+    property_data = detail.get("property") or {}
+    analysis_data = detail.get("analysis") or {}
+
+    if not property_data:
+        st.warning("Geen details gevonden voor dit object.")
+        return
+
+    if analysis_data:
+        combined_analysis = _build_selected_analysis(property_data, analysis_data)
+        _render_analysis_result(property_data.get("source_url") or "", combined_analysis)
+    else:
+        st.subheader(property_data.get("title") or "Onbekend object")
+        st.write(f"Adres: {property_data.get('address') or 'Onbekend'}")
+        st.write(f"Stad: {property_data.get('city') or 'Onbekend'}")
+        st.write(f"Vraagprijs: {_format_currency(property_data.get('asking_price'))}")
+        if property_data.get("source_url"):
+            st.link_button("Bronlink", property_data.get("source_url"))
+        st.info("Nog geen analysegegevens beschikbaar voor dit object.")
+
+
+def _render_dashboard_page():
+    st.subheader("Dashboard")
+
+    stats = DATABASE_SERVICE.get_dashboard_statistics()
+    total_properties = stats.get("total_properties", 0)
+    total_analyses = stats.get("total_analyses", 0)
+    average_score = stats.get("average_investment_score", 0)
+    highest_score = stats.get("highest_investment_score", 0)
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Totaal opgeslagen properties", total_properties)
+    with col2:
+        st.metric("Totaal analyses", total_analyses)
+    with col3:
+        st.metric("Gemiddelde investment score", average_score)
+    with col4:
+        st.metric("Hoogste investment score", highest_score)
+
+    city_counts = stats.get("properties_by_city") or {}
+    st.markdown("### Properties per stad")
+    if city_counts:
+        st.dataframe(
+            [{"Stad": city, "Aantal": count} for city, count in sorted(city_counts.items(), key=lambda item: item[1], reverse=True)],
+            use_container_width=True,
+        )
+    else:
+        st.info("Nog geen stadsgegevens beschikbaar.")
+
+    st.markdown("### Top 5 hoogste scores")
+    top_properties = stats.get("top_properties") or []
+    if top_properties:
+        st.dataframe(
+            [
+                {
+                    "Score": _safe_score(item.get("investment_score")),
+                    "Titel": item.get("title") or "Onbekend",
+                    "Adres": item.get("address") or "Onbekend",
+                    "Stad": item.get("city") or "Onbekend",
+                    "Vraagprijs": _format_currency(item.get("asking_price")),
+                }
+                for item in top_properties
+            ],
+            use_container_width=True,
+        )
+    else:
+        st.info("Nog geen scoregegevens beschikbaar.")
+
+    st.markdown("### 5 meest recent geanalyseerde properties")
+    recent_properties = stats.get("recent_properties") or []
+    if recent_properties:
+        st.dataframe(
+            [
+                {
+                    "Datum": item.get("created_at") or "Onbekend",
+                    "Score": _safe_score(item.get("investment_score")),
+                    "Titel": item.get("title") or "Onbekend",
+                    "Adres": item.get("address") or "Onbekend",
+                    "Stad": item.get("city") or "Onbekend",
+                }
+                for item in recent_properties
+            ],
+            use_container_width=True,
+        )
+    else:
+        st.info("Nog geen recente analyses beschikbaar.")
+
+
+def main():
+    st.set_page_config(page_title="PropertyHunter AI", page_icon="🏠", layout="centered")
+    st.title("PropertyHunter AI")
+    with st.sidebar:
+        st.markdown("## Navigatie")
+        page = st.radio("Kies een onderdeel", ["Nieuwe analyse", "Mijn analyses", "Dashboard"], index=0)
+
+    if page == "Nieuwe analyse":
+        _render_new_analysis_page()
+    elif page == "Mijn analyses":
+        _render_my_analyses_page()
+    else:
+        _render_dashboard_page()
 
 
 if __name__ == "__main__":
