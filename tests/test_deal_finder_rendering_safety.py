@@ -9,7 +9,7 @@ class DealFinderRenderingSafetyTests(unittest.TestCase):
         source = app_path.read_text(encoding="utf-8")
         tree = ast.parse(source)
 
-        function_names = {"_render_deal_finder_page", "_render_analysis_result", "_render_rows_with_columns"}
+        function_names = {"_render_deal_finder_page", "_render_analysis_result", "_render_rows_with_columns", "_render_deal_candidate_cards"}
         function_sources = []
         for node in tree.body:
             if isinstance(node, ast.FunctionDef) and node.name in function_names:

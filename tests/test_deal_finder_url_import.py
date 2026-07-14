@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import _run_url_import
+from deal_finder.extraction import ListingExtractionResult
 from deal_finder.orchestrator import DealFinderOrchestrator
 
 
@@ -70,39 +71,100 @@ class FailingOrchestrator:
 
 
 class DealFinderUrlImportTests(unittest.TestCase):
+    @staticmethod
+    def _result(url: str, *, success: bool = True, price: float | None = None, surface: float | None = None, title: str | None = None) -> ListingExtractionResult:
+        return ListingExtractionResult(
+            success=success,
+            source_url=url,
+            title=title,
+            address="Kanaalweg 50",
+            postal_code="3526KL",
+            city="Utrecht",
+            asking_price=price,
+            surface_m2=surface,
+            property_type="CommercialProperty",
+            description="Sample listing",
+            images=["https://example.com/a.jpg"],
+            extraction_method="json_ld" if success else "none",
+            confidence=0.9 if success else 0.0,
+            warnings=[] if success else ["Extraction failed"],
+            raw_metadata={},
+        )
+
     def test_valid_pasted_url(self):
-        orchestrator = DealFinderOrchestrator(UrlImportDbStub())
+        orchestrator = DealFinderOrchestrator(
+            UrlImportDbStub(),
+            metadata_extractor=lambda url: self._result(url, price=500000, surface=220, title="GB Object"),
+        )
         result = orchestrator.import_urls("https://www.gbmakelaars.nl/object/123\n")
         self.assertEqual(result["found"], 1)
         self.assertEqual(result["new"], 1)
+        self.assertEqual(len(result.get("enrichment") or []), 1)
+        self.assertTrue((result.get("enrichment") or [])[0].get("success"))
 
     def test_malformed_url(self):
-        orchestrator = DealFinderOrchestrator(UrlImportDbStub())
+        orchestrator = DealFinderOrchestrator(UrlImportDbStub(), metadata_extractor=lambda url: self._result(url, success=False))
         result = orchestrator.import_urls("notaurl\n")
         self.assertEqual(result["found"], 0)
         self.assertTrue(result["warnings"])
 
-    def test_unreachable_url_is_not_fetched(self):
-        orchestrator = DealFinderOrchestrator(UrlImportDbStub())
+    def test_unreachable_url_gracefully_keeps_record(self):
+        orchestrator = DealFinderOrchestrator(UrlImportDbStub(), metadata_extractor=lambda url: self._result(url, success=False))
+        result = orchestrator.import_urls("https://this-domain-should-not-resolve.invalid/listing\n")
+        self.assertEqual(result["found"], 1)
+        self.assertEqual(result["new"], 1)
+        enrichment = result.get("enrichment") or []
+        self.assertEqual(len(enrichment), 1)
+        self.assertFalse(enrichment[0].get("success"))
+
+    def test_duplicate_url_enrichment_snapshot_unchanged(self):
+        db = UrlImportDbStub()
+        orchestrator = DealFinderOrchestrator(
+            db,
+            metadata_extractor=lambda url: self._result(url, success=True, price=350000, surface=120, title="Same Title"),
+        )
+        first = orchestrator.import_urls("https://example.com/a\n")
+        second = orchestrator.import_urls("https://example.com/a\n")
+        self.assertEqual(first["new"], 1)
+        self.assertEqual(second["changed"], 0)
+
+    def test_snapshot_created_when_price_changes(self):
+        db = UrlImportDbStub()
+        prices = iter([300000.0, 275000.0])
+
+        def extractor(url: str) -> ListingExtractionResult:
+            return self._result(url, success=True, price=next(prices), surface=95, title="Prijs aangepast")
+
+        orchestrator = DealFinderOrchestrator(db, metadata_extractor=extractor)
+        first = orchestrator.import_urls("https://example.com/price\n")
+        second = orchestrator.import_urls("https://example.com/price\n")
+        self.assertEqual(first["new"], 1)
+        self.assertEqual(second["changed"], 1)
+
+    def test_no_live_http_calls_in_import_with_stubbed_extractor(self):
+        orchestrator = DealFinderOrchestrator(
+            UrlImportDbStub(),
+            metadata_extractor=lambda url: self._result(url, success=True, price=500000),
+        )
         with patch("requests.get") as mocked_get:
-            result = orchestrator.import_urls("https://this-domain-should-not-resolve.invalid/listing\n")
+            result = orchestrator.import_urls("https://example.com/abc\n")
             mocked_get.assert_not_called()
         self.assertEqual(result["found"], 1)
 
     def test_duplicate_url(self):
         db = UrlImportDbStub()
-        orchestrator = DealFinderOrchestrator(db)
+        orchestrator = DealFinderOrchestrator(db, metadata_extractor=lambda url: self._result(url, success=True, price=450000))
         result = orchestrator.import_urls("https://example.com/a\nhttps://example.com/a\n")
         self.assertEqual(result["found"], 2)
         self.assertEqual(len(db.listings), 1)
 
     def test_missing_source(self):
-        orchestrator = DealFinderOrchestrator(UrlImportDbStub(missing_source=True))
+        orchestrator = DealFinderOrchestrator(UrlImportDbStub(missing_source=True), metadata_extractor=lambda url: self._result(url, success=False))
         result = orchestrator.import_urls("https://example.com/a\n")
         self.assertTrue(any("Source could not be resolved" in warning for warning in result["warnings"]))
 
     def test_database_error(self):
-        orchestrator = DealFinderOrchestrator(UrlImportDbStub(fail_on_upsert_listing=True))
+        orchestrator = DealFinderOrchestrator(UrlImportDbStub(fail_on_upsert_listing=True), metadata_extractor=lambda url: self._result(url, success=True, price=400000))
         with self.assertRaises(RuntimeError):
             orchestrator.import_urls("https://example.com/a\n")
 

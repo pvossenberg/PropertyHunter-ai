@@ -114,6 +114,8 @@ class PropertyHunterTests(unittest.TestCase):
         self.assertEqual(_format_currency(1450000), "€ 1.450.000")
         self.assertEqual(_format_currency("1450000"), "€ 1.450.000")
         self.assertEqual(_format_currency("abc"), "Onbekend")
+        self.assertEqual(_format_currency(1775000), "€ 1.775.000")
+        self.assertNotIn("\n", _format_currency(1775000))
 
     def test_format_number_handles_missing_and_valid_values(self):
         self.assertEqual(_format_number(4250), "4.250")

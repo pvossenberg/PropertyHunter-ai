@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from deal_finder.deduplication import match_listing
+from deal_finder.extraction import ListingExtractionResult, extract_listing_metadata
 from deal_finder.models import NormalizedListing
 from deal_finder.ranking import rank_listing
 from deal_finder.sources.manual_import import ManualImportAdapter
 from services.database import DatabaseService
+
+LOGGER = logging.getLogger(__name__)
 
 DEFAULT_SOURCES = [
     {"name": "Funda", "source_type": "portal", "base_url": "https://www.funda.nl", "is_enabled": False},
@@ -19,11 +23,54 @@ DEFAULT_SOURCES = [
     {"name": "Local broker websites", "source_type": "broker", "base_url": None, "is_enabled": False},
 ]
 
+MISSING_TEXT_VALUES = {"", "unknown", "onbekend", "n.v.t.", "nvt", "none", "null"}
+
+
+def _normalize_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split()).strip()
+
+
+def _is_missing_text(value: Any) -> bool:
+    return _normalize_text(value).lower() in MISSING_TEXT_VALUES
+
+
+def _is_generic_title(value: Any, source_name: str) -> bool:
+    normalized = _normalize_text(value).lower()
+    source_normalized = _normalize_text(source_name).lower()
+    if not normalized:
+        return True
+    if normalized == source_normalized:
+        return True
+    if normalized in {"makelaar", "makelaars", "broker listing", "listing"}:
+        return True
+    return normalized.endswith(" makelaars") and len(normalized.split()) <= 3
+
+
+def _choose_text_value(field_name: str, existing: Any, extracted: Any, source_name: str) -> Any:
+    if _is_missing_text(extracted):
+        return existing
+    if _is_missing_text(existing):
+        return extracted
+    if field_name == "title" and _is_generic_title(existing, source_name):
+        return extracted
+    return existing
+
+
+def _updated_metadata_fields(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
+    changed: list[str] = []
+    for key in ("title", "address", "postal_code", "city", "asking_price", "surface_m2", "property_type"):
+        if before.get(key) != after.get(key):
+            changed.append(key)
+    return changed
+
 
 class DealFinderOrchestrator:
-    def __init__(self, database_service: DatabaseService):
+    def __init__(self, database_service: DatabaseService, metadata_extractor=extract_listing_metadata):
         self.database_service = database_service
         self.manual_adapter = ManualImportAdapter()
+        self.metadata_extractor = metadata_extractor
 
     def seed_default_sources(self) -> list[dict[str, Any]]:
         seeded: list[dict[str, Any]] = []
@@ -55,8 +102,68 @@ class DealFinderOrchestrator:
             warnings,
             source_name="Local broker websites",
             source_type="broker",
-            configuration={"mode": "manual_url_import", "network_fetch": False},
+            configuration={"mode": "manual_url_import", "network_fetch": True},
+            enrich_metadata=True,
         )
+
+    def refresh_listing_metadata(self, listing_id: str) -> dict[str, Any]:
+        detail = self.database_service.get_listing_detail(listing_id)
+        listing = detail.get("listing") or {}
+        if not listing:
+            return {"ok": False, "error": "Listing not found."}
+
+        listing_row, extraction_result = self._enrich_listing_row(
+            listing_row=listing,
+            source_id=listing.get("source_id"),
+            external_listing_id=listing.get("external_listing_id"),
+            source_name=(detail.get("source") or {}).get("name") or "Local broker websites",
+            dedupe_property_id=listing.get("property_id"),
+        )
+
+        if not listing_row.get("id"):
+            return {
+                "ok": False,
+                "error": "Listing metadata refresh failed.",
+                "extraction": extraction_result.to_dict(),
+            }
+
+        snapshot_result = self.database_service.add_listing_snapshot_if_changed(
+            listing_id=str(listing_row.get("id")),
+            snapshot={
+                "asking_price": listing_row.get("asking_price"),
+                "listing_status": listing_row.get("listing_status") or "active",
+                "title": listing_row.get("title"),
+                "description": listing_row.get("description"),
+                "surface_m2": listing_row.get("surface_m2"),
+                "features": {},
+                "raw_payload": listing_row.get("raw_payload") or {},
+            },
+        )
+
+        ranking = self._rank_listing_from_row(listing_row, source_name=(detail.get("source") or {}).get("name") or "manual")
+        existing_candidate = detail.get("candidate") or {}
+        self.database_service.create_or_update_deal_candidate(
+            listing_id=str(listing_row.get("id")),
+            property_id=listing_row.get("property_id"),
+            investment_score=None,
+            hidden_value_score=ranking.candidate_score,
+            priority=ranking.priority,
+            reasons=ranking.reason_codes,
+            review_status=existing_candidate.get("review_status") or "new",
+        )
+
+        refreshed_detail = self.database_service.get_listing_detail(str(listing_row.get("id")))
+
+        return {
+            "ok": True,
+            "listing_id": str(listing_row.get("id")),
+            "snapshot_changed": bool(snapshot_result.get("changed")),
+            "snapshot_change_type": snapshot_result.get("change_type"),
+            "extraction": extraction_result.to_dict(),
+            "listing": refreshed_detail.get("listing") or listing_row,
+            "candidate": refreshed_detail.get("candidate") or existing_candidate,
+            "latest_snapshot": refreshed_detail.get("latest_snapshot") or {},
+        }
 
     def _ingest_manual_listings(
         self,
@@ -65,6 +172,7 @@ class DealFinderOrchestrator:
         source_name: str,
         source_type: str = "manual_import",
         configuration: dict[str, Any] | None = None,
+        enrich_metadata: bool = False,
     ) -> dict[str, Any]:
         source_row = self.database_service.upsert_listing_source(
             name=source_name,
@@ -85,6 +193,7 @@ class DealFinderOrchestrator:
         changed = 0
         ingested_ids: list[str] = []
         match_logs: list[dict[str, Any]] = []
+        enrichment_results: list[dict[str, Any]] = []
 
         existing_rows = self.database_service.list_raw_listings(limit=5000)
         for listing in listings:
@@ -118,16 +227,40 @@ class DealFinderOrchestrator:
                 continue
             ingested_ids.append(str(listing_id))
 
+            if enrich_metadata:
+                listing_row, extraction_result = self._enrich_listing_row(
+                    listing_row=listing_row,
+                    source_id=str(source_id) if source_id else None,
+                    external_listing_id=listing.external_listing_id,
+                    source_name=source_name,
+                    dedupe_property_id=dedupe.matched_property_id,
+                )
+                enrichment_results.append(
+                    {
+                        "listing_id": str(listing_row.get("id") or listing_id),
+                        "source_url": listing.source_url,
+                        "success": extraction_result.success,
+                        "extraction_method": extraction_result.extraction_method,
+                        "confidence": extraction_result.confidence,
+                        "warnings": extraction_result.warnings,
+                    }
+                )
+                if extraction_result.warnings:
+                    warnings.extend([f"{listing.source_url}: {item}" for item in extraction_result.warnings])
+                listing_id = listing_row.get("id") if listing_row else listing_id
+                if not listing_id:
+                    continue
+
             snapshot_result = self.database_service.add_listing_snapshot_if_changed(
                 listing_id=str(listing_id),
                 snapshot={
-                    "asking_price": listing.asking_price,
-                    "listing_status": listing.listing_status,
-                    "title": listing.title,
-                    "description": listing.description,
-                    "surface_m2": listing.surface_m2,
+                    "asking_price": listing_row.get("asking_price"),
+                    "listing_status": listing_row.get("listing_status") or listing.listing_status,
+                    "title": listing_row.get("title") or listing.title,
+                    "description": listing_row.get("description") or listing.description,
+                    "surface_m2": listing_row.get("surface_m2") if listing_row else listing.surface_m2,
                     "features": {},
-                    "raw_payload": listing.raw_payload,
+                    "raw_payload": (listing_row or {}).get("raw_payload") or listing.raw_payload,
                 },
             )
 
@@ -136,15 +269,7 @@ class DealFinderOrchestrator:
             elif snapshot_result.get("changed"):
                 changed += 1
 
-            ranking = rank_listing(
-                listing,
-                context={
-                    "price_per_m2": (listing.asking_price / listing.surface_m2) if listing.asking_price and listing.surface_m2 else None,
-                    "days_on_market": None,
-                    "price_reduction_count": None,
-                    "investment_score": None,
-                },
-            )
+            ranking = self._rank_listing_from_row(listing_row=listing_row, source_name=source_name)
             self.database_service.create_or_update_deal_candidate(
                 listing_id=str(listing_id),
                 property_id=dedupe.matched_property_id,
@@ -171,4 +296,110 @@ class DealFinderOrchestrator:
             "changed": changed,
             "warnings": warnings,
             "listing_ids": ingested_ids,
+            "enrichment": enrichment_results,
         }
+
+    def _rank_listing_from_row(self, listing_row: dict[str, Any], source_name: str):
+        listing = NormalizedListing(
+            source_name=source_name,
+            source_url=str(listing_row.get("source_url") or ""),
+            external_listing_id=listing_row.get("external_listing_id"),
+            title=listing_row.get("title"),
+            address=listing_row.get("address"),
+            city=listing_row.get("city"),
+            asking_price=listing_row.get("asking_price"),
+            surface_m2=listing_row.get("surface_m2"),
+            property_type=listing_row.get("property_type"),
+            description=listing_row.get("description"),
+            listing_status=listing_row.get("listing_status") or "active",
+            raw_payload=listing_row.get("raw_payload") or {},
+        )
+        return rank_listing(
+            listing,
+            context={
+                "price_per_m2": (listing.asking_price / listing.surface_m2) if listing.asking_price and listing.surface_m2 else None,
+                "days_on_market": None,
+                "price_reduction_count": None,
+                "investment_score": None,
+            },
+        )
+
+    def _enrich_listing_row(
+        self,
+        *,
+        listing_row: dict[str, Any],
+        source_id: str | None,
+        external_listing_id: str | None,
+        source_name: str,
+        dedupe_property_id: str | None,
+    ) -> tuple[dict[str, Any], ListingExtractionResult]:
+        source_url = str(listing_row.get("source_url") or "")
+        extraction_result = self.metadata_extractor(source_url)
+
+        raw_payload = listing_row.get("raw_payload") if isinstance(listing_row.get("raw_payload"), dict) else {}
+        existing_postal_code = raw_payload.get("postal_code")
+
+        resolved_title = _choose_text_value("title", listing_row.get("title"), extraction_result.title, source_name)
+        resolved_address = _choose_text_value("address", listing_row.get("address"), extraction_result.address, source_name)
+        resolved_postal_code = _choose_text_value("postal_code", existing_postal_code, extraction_result.postal_code, source_name)
+        resolved_city = _choose_text_value("city", listing_row.get("city"), extraction_result.city, source_name)
+        resolved_asking_price = extraction_result.asking_price if extraction_result.asking_price is not None else listing_row.get("asking_price")
+        resolved_surface_m2 = extraction_result.surface_m2 if extraction_result.surface_m2 is not None else listing_row.get("surface_m2")
+        resolved_property_type = _choose_text_value("property_type", listing_row.get("property_type"), extraction_result.property_type, source_name)
+
+        updated_raw_payload = {
+            **raw_payload,
+            "postal_code": resolved_postal_code,
+            "metadata_extraction": {
+                "success": extraction_result.success,
+                "extraction_method": extraction_result.extraction_method,
+                "confidence": extraction_result.confidence,
+                "warnings": extraction_result.warnings,
+            },
+            "metadata": extraction_result.to_dict(),
+        }
+
+        merged_before = {
+            "title": listing_row.get("title"),
+            "address": listing_row.get("address"),
+            "postal_code": existing_postal_code,
+            "city": listing_row.get("city"),
+            "asking_price": listing_row.get("asking_price"),
+            "surface_m2": listing_row.get("surface_m2"),
+            "property_type": listing_row.get("property_type"),
+        }
+        merged_after = {
+            "title": resolved_title,
+            "address": resolved_address,
+            "postal_code": resolved_postal_code,
+            "city": resolved_city,
+            "asking_price": resolved_asking_price,
+            "surface_m2": resolved_surface_m2,
+            "property_type": resolved_property_type,
+        }
+
+        updated_listing = self.database_service.upsert_listing(
+            listing_id=str(listing_row.get("id") or "") or None,
+            source_id=source_id,
+            external_listing_id=external_listing_id,
+            source_url=source_url,
+            title=resolved_title,
+            address=resolved_address,
+            city=resolved_city,
+            asking_price=resolved_asking_price,
+            surface_m2=resolved_surface_m2,
+            property_type=resolved_property_type,
+            listing_status=listing_row.get("listing_status") or "active",
+            raw_payload=updated_raw_payload,
+            dedupe_match=type("Dedupe", (), {"matched_property_id": dedupe_property_id})(),
+        )
+
+        LOGGER.info(
+            "Listing metadata refresh listing_id=%s source=%s extraction_success=%s updated_fields=%s",
+            listing_row.get("id"),
+            source_name,
+            extraction_result.success,
+            _updated_metadata_fields(merged_before, merged_after),
+        )
+
+        return (updated_listing or listing_row), extraction_result

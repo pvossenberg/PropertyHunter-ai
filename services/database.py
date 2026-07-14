@@ -346,6 +346,7 @@ class DatabaseService:
     def upsert_listing(
         self,
         *,
+        listing_id: str | None = None,
         source_id: str | None,
         external_listing_id: str | None,
         source_url: str,
@@ -381,6 +382,11 @@ class DatabaseService:
             "raw_payload": raw_payload or {},
             "updated_at": now_iso,
         }
+
+        if isinstance(listing_id, str) and listing_id.strip():
+            updated = self._update_row("listings", listing_id.strip(), payload)
+            if updated:
+                return updated
 
         if source_id and external_listing_id:
             row = self._upsert_rows("listings", payload, on_conflict="source_id,external_listing_id")

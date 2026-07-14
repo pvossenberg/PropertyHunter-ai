@@ -80,6 +80,69 @@ def _render_rows_with_columns(rows: list[dict], columns: list[tuple[str, str]], 
             value_columns[index].write(_to_display_text(row.get(key)))
 
 
+def _render_deal_candidate_cards(candidates: list[dict]):
+    if not candidates:
+        st.info("Geen deal candidates gevonden voor de gekozen filters.")
+        return
+
+    for item in candidates:
+        listing = item.get("listing") or {}
+        source = item.get("source") or {}
+        title = listing.get("title") or "Onbekend"
+        address = listing.get("address") or "Onbekend"
+        city = listing.get("city") or "Onbekend"
+        asking_price = _format_currency(listing.get("asking_price"))
+        surface_value = listing.get("surface_m2")
+        surface_text = f"{_format_number(surface_value)} m²" if surface_value not in (None, "") else "Onbekend"
+        score_text = item.get("score") if item.get("score") is not None else "n.v.t."
+        priority = item.get("priority") or "n.v.t."
+        source_name = source.get("name") or "Onbekend"
+        review_status = item.get("review_status") or "new"
+
+        with st.container(border=True):
+            st.markdown(f"**{title}**")
+            st.write(f"{address} · {city}")
+            st.write(f"Vraagprijs: {asking_price}")
+            st.write(f"Oppervlakte: {surface_text}")
+            st.write(f"Score: {score_text} | Priority: {priority} | Bron: {source_name} | Review status: {review_status}")
+
+
+def _clear_deal_finder_refresh_state():
+    st.session_state.pop("deal_candidate_select", None)
+
+
+def _deal_candidate_listing_id(candidate: dict) -> str:
+    listing = candidate.get("listing") or {}
+    return str(listing.get("id") or "")
+
+
+def _deal_candidate_label(candidate: dict) -> str:
+    listing = candidate.get("listing") or {}
+    return (
+        f"{listing.get('title') or 'Onbekend'} | score {candidate.get('score') if candidate.get('score') is not None else 'n.v.t.'} | "
+        f"{candidate.get('priority') or 'n.v.t.'}"
+    )
+
+
+def _resolve_selected_deal_candidate(candidates: list[dict]) -> dict:
+    candidate_map = {_deal_candidate_listing_id(item): item for item in candidates if _deal_candidate_listing_id(item)}
+    if not candidate_map:
+        return {}
+
+    candidate_ids = list(candidate_map.keys())
+    preferred_listing_id = str(st.session_state.get("deal_selected_listing_id") or "")
+    default_index = candidate_ids.index(preferred_listing_id) if preferred_listing_id in candidate_map else 0
+    selected_listing_id = st.selectbox(
+        "Selecteer listing",
+        candidate_ids,
+        index=default_index,
+        key="deal_candidate_select",
+        format_func=lambda listing_id: _deal_candidate_label(candidate_map.get(str(listing_id), {})),
+    )
+    st.session_state["deal_selected_listing_id"] = str(selected_listing_id or candidate_ids[0])
+    return candidate_map.get(str(selected_listing_id), candidate_map[candidate_ids[0]])
+
+
 def _deal_finder_marker(message: str):
     LOGGER.warning("[DEAL_FINDER_MARKER] %s", message)
 
@@ -871,6 +934,13 @@ def _render_deal_finder_page():
             if result.get("warnings"):
                 for warning in result["warnings"]:
                     st.warning(warning)
+            enrichment_items = result.get("enrichment") or []
+            failed_enrichment = [item for item in enrichment_items if not item.get("success")]
+            if failed_enrichment:
+                st.warning(
+                    "URL-records zijn opgeslagen, maar metadata enrichment mislukte voor "
+                    f"{len(failed_enrichment)} listing(s)."
+                )
             st.session_state["deal_last_url_import"] = {
                 "status": "ok",
                 "found": result.get("found") or 0,
@@ -878,6 +948,7 @@ def _render_deal_finder_page():
                 "changed": result.get("changed") or 0,
                 "warnings": result.get("warnings") or [],
                 "listing_ids": result.get("listing_ids") or [],
+                "enrichment": enrichment_items,
             }
         _deal_finder_marker("url_import_done")
 
@@ -908,6 +979,29 @@ def _render_deal_finder_page():
             warnings = last_url_import.get("warnings") or []
             for warning in warnings:
                 st.warning(warning)
+            enrichment_items = last_url_import.get("enrichment") or []
+            if enrichment_items:
+                enrichment_rows = [
+                    {
+                        "source_url": item.get("source_url") or "",
+                        "success": bool(item.get("success")),
+                        "method": item.get("extraction_method") or "none",
+                        "confidence": item.get("confidence") if item.get("confidence") is not None else 0,
+                        "warnings": "; ".join(item.get("warnings") or []),
+                    }
+                    for item in enrichment_items
+                ]
+                _render_rows_with_columns(
+                    rows=enrichment_rows,
+                    columns=[
+                        ("Source URL", "source_url"),
+                        ("Success", "success"),
+                        ("Methode", "method"),
+                        ("Confidence", "confidence"),
+                        ("Warnings", "warnings"),
+                    ],
+                    empty_message="Geen enrichmentresultaten.",
+                )
     _deal_finder_marker("manual_import_section_done")
 
     st.markdown("### New deal candidates")
@@ -951,44 +1045,9 @@ def _render_deal_finder_page():
         _deal_finder_marker("deal_candidates_section_done_empty")
         return
 
-    candidate_rows = [
-        {
-            "candidate_id": item.get("id"),
-            "score": item.get("score"),
-            "priority": item.get("priority"),
-            "title": (item.get("listing") or {}).get("title") or "Onbekend",
-            "address": (item.get("listing") or {}).get("address") or "Onbekend",
-            "city": (item.get("listing") or {}).get("city") or "Onbekend",
-            "asking_price": _format_currency((item.get("listing") or {}).get("asking_price")),
-            "source": (item.get("source") or {}).get("name") or "Onbekend",
-            "detected": item.get("detected_at") or "",
-            "review_status": item.get("review_status") or "new",
-        }
-        for item in candidates
-    ]
-    _render_rows_with_columns(
-        rows=candidate_rows,
-        columns=[
-            ("Candidate ID", "candidate_id"),
-            ("Score", "score"),
-            ("Priority", "priority"),
-            ("Titel", "title"),
-            ("Adres", "address"),
-            ("Stad", "city"),
-            ("Vraagprijs", "asking_price"),
-            ("Bron", "source"),
-            ("Detected", "detected"),
-            ("Review status", "review_status"),
-        ],
-        empty_message="Geen deal candidates gevonden voor de gekozen filters.",
-    )
+    _render_deal_candidate_cards(candidates)
 
-    selected_candidate = st.selectbox(
-        "Selecteer listing",
-        candidates,
-        key="deal_candidate_select",
-        format_func=lambda item: f"{(item.get('listing') or {}).get('title') or 'Onbekend'} | score {item.get('score') if item.get('score') is not None else 'n.v.t.'} | {item.get('priority') or 'n.v.t.'}",
-    )
+    selected_candidate = _resolve_selected_deal_candidate(candidates)
 
     listing = (selected_candidate or {}).get("listing") or {}
     listing_id = listing.get("id")
@@ -1007,6 +1066,7 @@ def _render_deal_finder_page():
     st.write(f"Adres: {listing_detail.get('address') or 'Onbekend'}")
     st.write(f"Stad: {listing_detail.get('city') or 'Onbekend'}")
     st.write(f"Vraagprijs: {_format_currency(listing_detail.get('asking_price'))}")
+    st.write(f"Oppervlakte: {_format_number(listing_detail.get('surface_m2'))} m²")
     st.write(f"Status: {listing_detail.get('listing_status') or 'Onbekend'}")
     st.write(f"Bron: {source_detail.get('name') or 'Onbekend'}")
     st.write(f"Priority: {candidate_detail.get('priority') or 'Onbekend'}")
@@ -1014,13 +1074,55 @@ def _render_deal_finder_page():
     if listing_detail.get("source_url"):
         st.link_button("Open listing", listing_detail.get("source_url"))
 
-    col_review, col_analyze = st.columns(2)
+    metadata_payload = listing_detail.get("raw_payload") if isinstance(listing_detail.get("raw_payload"), dict) else {}
+    metadata_info = metadata_payload.get("metadata") if isinstance(metadata_payload.get("metadata"), dict) else {}
+    extraction_meta = metadata_payload.get("metadata_extraction") if isinstance(metadata_payload.get("metadata_extraction"), dict) else {}
+    extraction_status = "success" if extraction_meta.get("success") else "failed"
+    st.markdown("#### Metadata extractie")
+    st.write(f"Extraction status: {extraction_status}")
+    st.write(f"Extraction methode: {extraction_meta.get('extraction_method') or 'none'}")
+    st.write(f"Confidence: {extraction_meta.get('confidence') if extraction_meta.get('confidence') is not None else 0}")
+    if metadata_info.get("title"):
+        st.write(f"Metadata titel: {metadata_info.get('title')}")
+    if metadata_info.get("address"):
+        st.write(f"Metadata adres: {metadata_info.get('address')}")
+    if metadata_info.get("city"):
+        st.write(f"Metadata stad: {metadata_info.get('city')}")
+    if metadata_info.get("asking_price") is not None:
+        st.write(f"Metadata vraagprijs: {_format_currency(metadata_info.get('asking_price'))}")
+    if metadata_info.get("surface_m2") is not None:
+        st.write(f"Metadata oppervlakte: {_format_number(metadata_info.get('surface_m2'))} m²")
+    extraction_warnings = extraction_meta.get("warnings") if isinstance(extraction_meta.get("warnings"), list) else []
+    if extraction_warnings:
+        for warning in extraction_warnings:
+            st.warning(str(warning))
+
+    col_review, col_refresh, col_analyze = st.columns(3)
     with col_review:
         if st.button("Markeer reviewed", key="mark_candidate_reviewed"):
             candidate_id = selected_candidate.get("id") if isinstance(selected_candidate, dict) else None
             if candidate_id:
                 DATABASE_SERVICE.mark_candidate_reviewed(str(candidate_id), review_status="reviewed")
                 st.success("Candidate gemarkeerd als reviewed.")
+
+    with col_refresh:
+        if st.button("Metadata opnieuw ophalen", key="refresh_listing_metadata"):
+            refresh_result = DEAL_FINDER_ORCHESTRATOR.refresh_listing_metadata(str(listing_id))
+            if refresh_result.get("ok"):
+                extraction = refresh_result.get("extraction") or {}
+                status_label = "succesvol" if extraction.get("success") else "mislukt"
+                st.success(
+                    "Metadata opnieuw opgehaald: "
+                    f"{status_label}, snapshot_changed={bool(refresh_result.get('snapshot_changed'))}"
+                )
+                if extraction.get("warnings"):
+                    for warning in extraction.get("warnings"):
+                        st.warning(str(warning))
+                st.session_state["deal_selected_listing_id"] = str(refresh_result.get("listing_id") or listing_id)
+                _clear_deal_finder_refresh_state()
+                st.rerun()
+            else:
+                st.error(f"Metadata ophalen mislukt: {refresh_result.get('error') or 'Onbekende fout'}")
 
     with col_analyze:
         if st.button("Analyseer geselecteerde listing", key="analyze_selected_listing"):
