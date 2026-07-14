@@ -57,10 +57,10 @@ def rank_listing(listing: NormalizedListing, context: dict[str, Any] | None = No
     else:
         missing.append("price_reduction_data_missing")
 
-    investment_score = context.get("investment_score")
-    if isinstance(investment_score, (int, float)):
-        score += max(0, min(25, int(investment_score / 4)))
-        reasons.append("investment_score_used")
+    investment_points, investment_reason = _score_investment_signals(context)
+    if investment_points is not None:
+        score += investment_points
+        reasons.append(investment_reason)
     else:
         missing.append("investment_score_missing")
 
@@ -102,3 +102,52 @@ def _priority_from_score(score: int) -> str:
     if score >= 45:
         return "medium"
     return "low"
+
+
+def _score_investment_signals(context: dict[str, Any]) -> tuple[int | None, str]:
+    direct_score = _extract_direct_investment_score(context)
+    if direct_score is not None:
+        # Direct investment score is expected on a 0-100 scale and maps to max 25 ranking points.
+        normalized = max(0.0, min(100.0, float(direct_score)))
+        return int(round((normalized / 100.0) * 25.0)), "investment_score_used"
+
+    yield_pct = _extract_yield_percentage(context)
+    if yield_pct is None:
+        return None, "investment_score_missing"
+
+    if yield_pct >= 10.0:
+        return 25, "yield_signal_strong"
+    if yield_pct >= 8.0:
+        return 21, "yield_signal_good"
+    if yield_pct >= 6.0:
+        return 16, "yield_signal_moderate"
+    if yield_pct >= 4.5:
+        return 10, "yield_signal_weak"
+    if yield_pct > 0:
+        return 5, "yield_signal_low"
+    return 0, "yield_signal_none"
+
+
+def _extract_direct_investment_score(context: dict[str, Any]) -> float | None:
+    candidates = [
+        context.get("investment_score"),
+        context.get("score"),
+        (context.get("analysis") or {}).get("investment_score") if isinstance(context.get("analysis"), dict) else None,
+    ]
+    for value in candidates:
+        if isinstance(value, (int, float)):
+            return float(value)
+    return None
+
+
+def _extract_yield_percentage(context: dict[str, Any]) -> float | None:
+    for key in ("gross_yield", "yield", "cap_rate", "roi"):
+        value = context.get(key)
+        if not isinstance(value, (int, float)):
+            continue
+        pct = float(value)
+        # Normalize ratio inputs (e.g. 0.065) into percentages.
+        if 0 < pct <= 1:
+            pct *= 100.0
+        return pct
+    return None

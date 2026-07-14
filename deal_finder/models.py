@@ -43,6 +43,14 @@ class RankingResult:
     priority: str
     reason_codes: list[str] = field(default_factory=list)
     missing_data_warnings: list[str] = field(default_factory=list)
+    component_scores: dict[str, int | None] = field(default_factory=dict)
+    confidence_score: int = 0
+    strengths: list[str] = field(default_factory=list)
+    risks: list[str] = field(default_factory=list)
+    missing_information: list[str] = field(default_factory=list)
+    assumptions: list[str] = field(default_factory=list)
+    calculated_metrics: dict[str, Any] = field(default_factory=dict)
+    scenario_inputs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

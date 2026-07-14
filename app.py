@@ -490,6 +490,67 @@ def _safe_number(value) -> float | None:
         return None
 
 
+def _deal_rating_from_score(score: int | None) -> str:
+    if score is None:
+        return "Onbekend"
+    if score >= 85:
+        return "A+"
+    if score >= 70:
+        return "A"
+    if score >= 55:
+        return "B"
+    if score >= 40:
+        return "C"
+    return "D"
+
+
+def _deal_summary_text_from_rating(rating: str) -> str:
+    if rating in {"A+", "A"}:
+        return "Sterke deal"
+    if rating == "B":
+        return "Nader onderzoeken"
+    if rating in {"C", "D"}:
+        return "Zwakke deal"
+    return "Nader onderzoeken"
+
+
+def _extract_gross_yield_value(*payloads: dict) -> float | None:
+    keys = ("gross_yield", "yield", "cap_rate", "roi")
+    candidates: list[dict] = []
+
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        candidates.append(payload)
+
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            candidates.append(metadata)
+
+        raw_payload = payload.get("raw_payload")
+        if isinstance(raw_payload, dict):
+            candidates.append(raw_payload)
+            raw_metadata = raw_payload.get("metadata")
+            if isinstance(raw_metadata, dict):
+                candidates.append(raw_metadata)
+
+    for candidate in candidates:
+        for key in keys:
+            value = candidate.get(key)
+            if isinstance(value, (int, float)):
+                percentage = float(value)
+                if 0 < percentage <= 1:
+                    percentage *= 100.0
+                return percentage
+    return None
+
+
+def _format_percentage(value: float | None, decimals: int = 1) -> str:
+    if value is None:
+        return "Onbekend"
+    return f"{value:.{decimals}f}".replace(".", ",") + "%"
+
+
 def _parse_datetime(value) -> datetime:
     if not isinstance(value, str) or not value.strip():
         return datetime.min
@@ -1069,6 +1130,22 @@ def _render_deal_finder_page():
     st.write(f"Oppervlakte: {_format_number(listing_detail.get('surface_m2'))} m²")
     st.write(f"Status: {listing_detail.get('listing_status') or 'Onbekend'}")
     st.write(f"Bron: {source_detail.get('name') or 'Onbekend'}")
+
+    deal_score = _safe_score((selected_candidate or {}).get("score"))
+    if deal_score is None:
+        deal_score = _safe_score(candidate_detail.get("hidden_value_score"))
+
+    deal_rating = _deal_rating_from_score(deal_score)
+    deal_summary_text = _deal_summary_text_from_rating(deal_rating)
+    gross_yield_value = _extract_gross_yield_value(selected_candidate, listing_detail, latest_snapshot, candidate_detail)
+
+    with st.container(border=True):
+        st.markdown("#### Deal scorekaart")
+        st.markdown(f"**Investment score:** {deal_score}/100" if deal_score is not None else "**Investment score:** Onbekend")
+        st.markdown(f"**Deal rating:** {deal_rating}")
+        st.markdown(f"**Gross yield:** {_format_percentage(gross_yield_value)}")
+        st.caption(deal_summary_text)
+
     st.write(f"Priority: {candidate_detail.get('priority') or 'Onbekend'}")
     st.write(f"Reason codes: {', '.join(candidate_detail.get('reasons') or []) or 'Geen'}")
     if listing_detail.get("source_url"):
