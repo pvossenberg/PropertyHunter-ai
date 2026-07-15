@@ -1,8 +1,20 @@
 import unittest
 from datetime import date
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from ai.analyzer import PROPERTY_ANALYSIS_SCHEMA, REQUIRED_KEYS, _infer_asking_price_fields, analyze_property, _validate_analysis_payload
-from app import _format_currency, _format_number, _label_score, _render_analysis_result
+from app import (
+    _build_investment_intelligence,
+    _format_currency,
+    _format_number,
+    _investment_intelligence_rating,
+    _label_score,
+    _run_source_scan,
+    _render_analysis_result,
+)
+from deal_finder.models import NormalizedListing
+from deal_finder.sources.base import SourceRecordResult
 from models.investment_profile import InvestmentProfile
 from models.permit import PermitRecord
 from models.property import Property
@@ -13,6 +25,87 @@ from services.calculations import calculate_days_on_market, calculate_discount_p
 
 
 class PropertyHunterTests(unittest.TestCase):
+    def test_run_source_scan_writes_json_and_counts_results(self):
+        class FakeDatabaseService:
+            def __init__(self):
+                self.is_enabled = True
+                self.saved_payloads = []
+
+            def upsert_property(self, property_payload):
+                self.saved_payloads.append(property_payload)
+                return {"id": f"property-{len(self.saved_payloads)}", **property_payload}
+
+        class FakeAdapter:
+            source_name = "funda.nl"
+            default_start_url = "https://www.funda.nl/zoeken/koop"
+
+            def validate_configuration(self, configuration):
+                return True, []
+
+            def load_and_normalize_listings(self, configuration):
+                listing = NormalizedListing(
+                    source_name=self.source_name,
+                    external_listing_id="f-1",
+                    source_url="https://www.funda.nl/detail/koop/amsterdam/object-1/11111111/",
+                    title="Test listing",
+                    city="Amsterdam",
+                    asking_price=450000.0,
+                    surface_m2=90.0,
+                    listing_status="active",
+                    raw_payload={"source_url": "https://www.funda.nl/detail/koop/amsterdam/object-1/11111111/"},
+                )
+                return [
+                    SourceRecordResult(record_index=1, success=True, listing=listing, payload=dict(listing.raw_payload)),
+                    SourceRecordResult(record_index=2, success=False, listing=None, error="ValueError: malformed listing", payload={"source_url": "https://www.funda.nl/detail/koop/amsterdam/object-2/22222222/"}),
+                ]
+
+            def get_last_fetch_stats(self):
+                return {"listings_found": 2, "listings_imported": 1, "duplicates_skipped": 0, "failed_listings": 1}
+
+            def to_property_model(self, payload):
+                return Property(
+                    source_url=payload["source_url"],
+                    title="Test listing",
+                    city="Amsterdam",
+                    asking_price=450000.0,
+                    surface_m2=90.0,
+                    listing_status="active",
+                )
+
+        class FakeRegistry:
+            def __init__(self, adapter):
+                self.adapter = adapter
+
+            def resolve(self, source_name):
+                return self.adapter if source_name == "funda" else None
+
+        class FakeOrchestrator:
+            def __init__(self, adapter):
+                self.source_registry = FakeRegistry(adapter)
+
+        database_service = FakeDatabaseService()
+        orchestrator = FakeOrchestrator(FakeAdapter())
+
+        with TemporaryDirectory() as temp_dir:
+            result = _run_source_scan(
+                "funda",
+                orchestrator=orchestrator,
+                database_service=database_service,
+                output_dir=Path(temp_dir),
+                max_pages=1,
+                timeout_seconds=1.0,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["listings_found"], 2)
+        self.assertEqual(result["listings_imported"], 1)
+        self.assertEqual(result["fully_imported"], 0)
+        self.assertEqual(result["partially_imported"], 1)
+        self.assertEqual(result["listings_failed"], 1)
+        self.assertGreaterEqual(result["average_import_time_seconds"], 0.0)
+        self.assertEqual(len(database_service.saved_payloads), 1)
+        self.assertTrue(result["output_path"].endswith(".json"))
+
     def test_fetch_page_text_rejects_non_http_urls(self):
         with self.assertRaises(ValueError):
             fetch_page_text("ftp://example.com")
@@ -126,6 +219,48 @@ class PropertyHunterTests(unittest.TestCase):
         self.assertEqual(_label_score("location"), "Locatie")
         self.assertEqual(_label_score("yield"), "Rendement")
         self.assertEqual(_label_score("unknown"), "Unknown")
+
+    def test_investment_intelligence_rating_scale(self):
+        self.assertEqual(_investment_intelligence_rating(90), "A+")
+        self.assertEqual(_investment_intelligence_rating(80), "A")
+        self.assertEqual(_investment_intelligence_rating(70), "B")
+        self.assertEqual(_investment_intelligence_rating(55), "C")
+        self.assertEqual(_investment_intelligence_rating(30), "D")
+
+    def test_investment_intelligence_builds_six_categories_and_score_range(self):
+        intelligence = _build_investment_intelligence(
+            city="Amsterdam",
+            surface_m2=95,
+            gross_yield_value=7.2,
+            discount_vs_market_value=8.5,
+            difference_percentage=2.0,
+            recommendation="Orange",
+        )
+        self.assertEqual(len(intelligence["categories"]), 6)
+        self.assertIn("overall_score", intelligence)
+        self.assertIn("rating", intelligence)
+        self.assertGreaterEqual(intelligence["overall_score"], 0)
+        self.assertLessEqual(intelligence["overall_score"], 100)
+        self.assertIn(intelligence["rating"], {"A+", "A", "B", "C", "D"})
+
+        category_names = [item["name"] for item in intelligence["categories"]]
+        self.assertEqual(
+            category_names,
+            [
+                "Location",
+                "Valuation",
+                "Rental potential",
+                "Transformation potential",
+                "Market momentum",
+                "Risk",
+            ],
+        )
+
+        for item in intelligence["categories"]:
+            self.assertGreaterEqual(item["score"], 0)
+            self.assertLessEqual(item["score"], 20)
+            self.assertTrue(isinstance(item["explanation"], str))
+            self.assertTrue(item["explanation"])
 
     def test_render_analysis_result_handles_empty_analysis_without_exception(self):
         try:

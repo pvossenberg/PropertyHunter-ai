@@ -115,6 +115,40 @@ create table if not exists public.energy_labels (
 create index if not exists idx_energy_labels_property_id on public.energy_labels (property_id);
 create unique index if not exists uq_energy_labels_current_per_property on public.energy_labels (property_id) where is_current = true;
 
+create table if not exists public.property_enrichments (
+    id uuid primary key default gen_random_uuid(),
+    property_id uuid not null references public.properties(id) on delete cascade,
+    enrichment_key text not null,
+    value jsonb,
+    source text not null,
+    retrieval_date timestamptz not null default timezone('utc', now()),
+    confidence_score integer not null default 0,
+    success boolean not null default true,
+    error_message text,
+    raw_payload jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default timezone('utc', now())
+);
+
+create index if not exists idx_property_enrichments_property_id on public.property_enrichments (property_id);
+create index if not exists idx_property_enrichments_enrichment_key on public.property_enrichments (enrichment_key);
+create index if not exists idx_property_enrichments_created_at on public.property_enrichments (created_at desc);
+
+create table if not exists public.property_enrichment_groups (
+    id uuid primary key default gen_random_uuid(),
+    property_id uuid not null references public.properties(id) on delete cascade unique,
+    status text not null default 'pending',
+    started_at timestamptz,
+    completed_at timestamptz,
+    source text,
+    warning_count integer not null default 0,
+    error_count integer not null default 0,
+    summary jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default timezone('utc', now())
+);
+
+create index if not exists idx_property_enrichment_groups_property_id on public.property_enrichment_groups (property_id);
+create index if not exists idx_property_enrichment_groups_status on public.property_enrichment_groups (status);
+
 create or replace function public.set_updated_at()
 returns trigger
 language plpgsql
@@ -135,3 +169,5 @@ alter table public.analyses enable row level security;
 alter table public.transactions enable row level security;
 alter table public.permits enable row level security;
 alter table public.energy_labels enable row level security;
+alter table public.property_enrichments enable row level security;
+alter table public.property_enrichment_groups enable row level security;

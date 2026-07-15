@@ -1,0 +1,18 @@
+{
+  "source": "marktplaats.nl",
+  "configuration": {
+    "start_url": "https://www.marktplaats.nl/",
+    "max_pages": 1,
+    "timeout_seconds": 1.0
+  },
+  "summary": {
+    "listings_found": 0,
+    "listings_imported": 0,
+    "listings_failed": 0,
+    "average_import_time_seconds": 0.0,
+    "total_elapsed_seconds": 0.0,
+    "warnings": []
+  },
+  "properties": [],
+  "failed_records": []
+}

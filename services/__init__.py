@@ -16,6 +16,10 @@ from .calculations import (
 from .property_history import MockPropertyHistoryProvider, PropertyHistoryService
 from .permit_service import PermitService
 from .location_service import LocationService
+from .comparable_sales import ComparableSalesService, PlaceholderComparableSalesProvider
+from .investment_intelligence import InvestmentIntelligenceConfig, InvestmentIntelligenceEngine, InvestmentIntelligenceResult, SourceScoringProfile
+from .opportunity_intelligence import OpportunityFinding, OpportunityIntelligenceConfig, OpportunityIntelligenceEngine, OpportunityIntelligenceResult
+from .property_enrichment import PropertyEnrichmentEngine, PropertyEnrichmentItem, PropertyEnrichmentResult
 
 __all__ = [
 	"calculate_days_on_market",
@@ -35,4 +39,17 @@ __all__ = [
 	"MockPropertyHistoryProvider",
 	"PermitService",
 	"LocationService",
+	"ComparableSalesService",
+	"PlaceholderComparableSalesProvider",
+	"InvestmentIntelligenceConfig",
+	"InvestmentIntelligenceEngine",
+	"InvestmentIntelligenceResult",
+	"SourceScoringProfile",
+	"OpportunityFinding",
+	"OpportunityIntelligenceConfig",
+	"OpportunityIntelligenceEngine",
+	"OpportunityIntelligenceResult",
+	"PropertyEnrichmentEngine",
+	"PropertyEnrichmentItem",
+	"PropertyEnrichmentResult",
 ]

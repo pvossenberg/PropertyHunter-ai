@@ -11,6 +11,34 @@ class StubDatabaseService(DatabaseService):
         self._client = object()
         self._rows_by_table = rows_by_table
 
+    def _insert_row(self, table_name, payload):
+        row = dict(payload)
+        row.setdefault("id", f"{table_name}-{len(self._rows_by_table.get(table_name, [])) + 1}")
+        self._rows_by_table.setdefault(table_name, []).append(row)
+        return dict(row)
+
+    def _update_row(self, table_name, row_id, payload):
+        rows = self._rows_by_table.get(table_name, [])
+        for idx, row in enumerate(rows):
+            if str(row.get("id")) == str(row_id):
+                updated = dict(row)
+                updated.update(payload)
+                rows[idx] = updated
+                return dict(updated)
+        return {}
+
+    def _upsert_rows(self, table_name, payload, on_conflict):
+        rows = self._rows_by_table.setdefault(table_name, [])
+        keys = [item.strip() for item in on_conflict.split(",")]
+        for idx, row in enumerate(rows):
+            if all(row.get(key) == payload.get(key) for key in keys):
+                updated = dict(row)
+                updated.update(payload)
+                updated.setdefault("id", row.get("id") or f"{table_name}-{idx + 1}")
+                rows[idx] = updated
+                return dict(updated)
+        return self._insert_row(table_name, payload)
+
     def _fetch_rows(
         self,
         table_name: str,
@@ -64,6 +92,9 @@ class DatabaseServiceTests(unittest.TestCase):
             "country": "NL",
             "asking_price": 500000,
             "asking_price_status": "known",
+            "bag_id": "0363010000000001",
+            "latest_woz_value": 475000,
+            "woz_valuation_year": 2025,
             "energy_label": "A",
             "previous_transactions": [
                 {
@@ -103,6 +134,9 @@ class DatabaseServiceTests(unittest.TestCase):
         property_payload = service._build_property_payload("https://example.com", extracted)
         self.assertEqual(property_payload["title"], "Test Object")
         self.assertEqual(property_payload["asking_price_status"], "known")
+        self.assertEqual(property_payload["bag_id"], "0363010000000001")
+        self.assertEqual(property_payload["latest_woz_value"], 475000)
+        self.assertEqual(property_payload["woz_valuation_year"], 2025)
 
         analysis_payload = service._build_analysis_payload("property-id", analysis)
         self.assertEqual(analysis_payload["property_id"], "property-id")
@@ -119,6 +153,35 @@ class DatabaseServiceTests(unittest.TestCase):
         energy_label = service._build_energy_label_payload("property-id", extracted)
         self.assertIsNotNone(energy_label)
         self.assertEqual(energy_label["label"], "A")
+
+    def test_upsert_property_updates_existing_source_url(self):
+        service = StubDatabaseService(
+            rows_by_table={
+                "properties": [
+                    {
+                        "id": "p1",
+                        "source_url": "https://example.com/property-1",
+                        "title": "Oud",
+                        "created_at": "2026-07-10T10:00:00+00:00",
+                    }
+                ]
+            }
+        )
+
+        row = service.upsert_property(
+            {
+                "source_url": "https://example.com/property-1",
+                "title": "Nieuw",
+                "address": "Voorbeeldstraat 1",
+                "city": "Amsterdam",
+                "listing_status": "active",
+                "raw_extracted_data": {"source_url": "https://example.com/property-1"},
+            }
+        )
+
+        self.assertEqual(row["id"], "p1")
+        self.assertEqual(row["title"], "Nieuw")
+        self.assertEqual(row["city"], "Amsterdam")
 
     def test_empty_database(self):
         service = StubDatabaseService(rows_by_table={})
@@ -264,6 +327,50 @@ class DatabaseServiceTests(unittest.TestCase):
             sort_option="Laagste vraagprijs",
         )
         self.assertEqual([item["id"] for item in sorted_by_price], ["p3", "p1", "p2"])
+
+    def test_property_enrichment_helpers_store_rows(self):
+        service = StubDatabaseService(rows_by_table={})
+
+        group = service.upsert_property_enrichment_group(
+            property_id="p1",
+            status="completed",
+            started_at="2026-07-15T10:00:00+00:00",
+            completed_at="2026-07-15T10:01:00+00:00",
+            source="https://example.com/p1",
+            warning_count=1,
+            error_count=0,
+            summary={"enrichment_count": 2},
+        )
+        self.assertEqual(group["property_id"], "p1")
+        self.assertEqual(group["status"], "completed")
+
+        rows = service.batch_upsert_property_enrichments(
+            property_id="p1",
+            enrichments=[
+                {
+                    "enrichment_key": "municipality",
+                    "value": "Amsterdam",
+                    "source": "mock",
+                    "retrieval_date": "2026-07-15T10:00:00+00:00",
+                    "confidence_score": 80,
+                    "success": True,
+                    "raw_payload": {"address": "Herengracht 1"},
+                },
+                {
+                    "enrichment_key": "permit_information",
+                    "value": None,
+                    "source": "placeholder",
+                    "retrieval_date": "2026-07-15T10:00:01+00:00",
+                    "confidence_score": 0,
+                    "success": False,
+                    "error_message": "Not implemented",
+                },
+            ],
+        )
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["enrichment_key"], "municipality")
+        self.assertFalse(rows[1]["success"])
 
 
 if __name__ == "__main__":

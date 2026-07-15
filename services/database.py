@@ -7,6 +7,7 @@ import json
 from typing import Any
 
 from config import SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
+from models.property import Property
 
 try:
     from supabase import Client, create_client
@@ -43,6 +44,18 @@ def _as_int(value: Any) -> int | None:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _json_safe_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe_value(item) for item in value]
+    return value
 
 
 def _normalize_source_url(url: str | None) -> str:
@@ -161,6 +174,17 @@ class DatabaseService:
 
     def list_raw_listings(self, limit: int = 5000) -> list[dict[str, Any]]:
         return self._fetch_rows("listings", limit=max(1, int(limit or 5000)))
+
+    def get_listing_snapshots(self, listing_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        if not isinstance(listing_id, str) or not listing_id.strip():
+            return []
+        return self._fetch_rows(
+            "listing_snapshots",
+            filters={"listing_id": listing_id.strip()},
+            limit=max(1, int(limit or 100)),
+            order_column="observed_at",
+            ascending=True,
+        )
 
     def list_properties(self, limit: int = 100, city: str | None = None) -> list[dict[str, Any]]:
         normalized_limit = max(1, int(limit or 100))
@@ -319,6 +343,58 @@ class DatabaseService:
         scan_id = row.get("id") if row else None
         return str(scan_id) if scan_id else None
 
+    def upsert_property(self, property_payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.is_enabled:
+            return {}
+
+        if not isinstance(property_payload, dict):
+            return {}
+
+        source_url = str(property_payload.get("source_url") or "").strip()
+        if not source_url:
+            return {}
+
+        payload = {
+            "source_url": source_url,
+            "title": property_payload.get("title"),
+            "address": property_payload.get("address"),
+            "city": property_payload.get("city"),
+            "country": property_payload.get("country"),
+            "asking_price": property_payload.get("asking_price"),
+            "asking_price_status": property_payload.get("asking_price_status") or "unknown",
+            "asking_price_text": property_payload.get("asking_price_text"),
+            "listed_since": property_payload.get("listed_since"),
+            "days_on_market": property_payload.get("days_on_market"),
+            "listing_status": property_payload.get("listing_status") or "unknown",
+            "original_asking_price": property_payload.get("original_asking_price"),
+            "current_asking_price": property_payload.get("current_asking_price"),
+            "price_reduction_count": property_payload.get("price_reduction_count") or 0,
+            "last_price_reduction_date": property_payload.get("last_price_reduction_date"),
+            "total_price_reduction_amount": property_payload.get("total_price_reduction_amount"),
+            "total_price_reduction_percentage": property_payload.get("total_price_reduction_percentage"),
+            "listing_history_source": property_payload.get("listing_history_source"),
+            "listing_history_confidence": property_payload.get("listing_history_confidence") or "unknown",
+            "surface_m2": property_payload.get("surface_m2"),
+            "price_per_m2": property_payload.get("price_per_m2"),
+            "annual_rent": property_payload.get("annual_rent"),
+            "property_type": property_payload.get("property_type"),
+            "current_use": property_payload.get("current_use"),
+            "zoning": property_payload.get("zoning"),
+            "description": property_payload.get("description"),
+            "raw_extracted_data": _json_safe_value(property_payload.get("raw_extracted_data") or property_payload),
+        }
+
+        existing_rows = self._fetch_rows("properties", limit=5000)
+        normalized_source_url = _normalize_source_url(source_url)
+        for row in existing_rows:
+            if normalized_source_url and normalized_source_url == _normalize_source_url(row.get("source_url")):
+                row_id = row.get("id")
+                if row_id:
+                    updated = self._update_row("properties", str(row_id), payload)
+                    return updated or row
+
+        return self._insert_row("properties", payload)
+
     def complete_scan_run(
         self,
         *,
@@ -379,7 +455,7 @@ class DatabaseService:
             "listing_status": listing_status or "active",
             "last_seen_at": now_iso,
             "is_active": (listing_status or "active") == "active",
-            "raw_payload": raw_payload or {},
+            "raw_payload": _json_safe_value(raw_payload or {}),
             "updated_at": now_iso,
         }
 
@@ -404,6 +480,88 @@ class DatabaseService:
 
         payload["first_seen_at"] = now_iso
         return self._insert_row("listings", payload)
+
+    def update_listing_history(self, listing_id: str, history_payload: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(listing_id, str) or not listing_id.strip() or not isinstance(history_payload, dict):
+            return {}
+
+        payload = {
+            "first_seen_date": history_payload.get("first_seen_date"),
+            "latest_seen_date": history_payload.get("latest_seen_date"),
+            "days_on_market": history_payload.get("days_on_market"),
+            "original_asking_price": history_payload.get("original_asking_price"),
+            "current_asking_price": history_payload.get("current_asking_price"),
+            "total_price_reduction_amount": history_payload.get("total_price_reduction"),
+            "total_price_reduction_percentage": history_payload.get("total_price_reduction_percentage"),
+            "price_reduction_count": history_payload.get("number_of_price_changes") or 0,
+            "reduction_frequency": history_payload.get("reduction_frequency"),
+            "listing_status": history_payload.get("listing_status") or "active",
+            "price_history": history_payload.get("price_history") or [],
+            "recently_relisted": bool(history_payload.get("recently_relisted", False)),
+            "relisted_date": history_payload.get("relisted_date"),
+            "listing_history_source": history_payload.get("source") or "listing_snapshots",
+            "listing_history_confidence": history_payload.get("confidence") or "high",
+            "updated_at": _utc_now_iso(),
+        }
+        return self._update_row("listings", listing_id.strip(), payload)
+
+    def upsert_property_enrichment_group(self, *, property_id: str, status: str, started_at: str | None = None, completed_at: str | None = None, source: str | None = None, warning_count: int = 0, error_count: int = 0, summary: dict[str, Any] | None = None) -> dict[str, Any]:
+        if not isinstance(property_id, str) or not property_id.strip():
+            return {}
+        payload = {
+            "property_id": property_id.strip(),
+            "status": status or "pending",
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "source": source,
+            "warning_count": max(0, int(warning_count or 0)),
+            "error_count": max(0, int(error_count or 0)),
+            "summary": summary or {},
+        }
+        existing = self._fetch_rows("property_enrichment_groups", filters={"property_id": property_id.strip()}, limit=1)
+        if existing:
+            row_id = existing[0].get("id")
+            if row_id:
+                return self._update_row("property_enrichment_groups", str(row_id), payload)
+        return self._insert_row("property_enrichment_groups", payload)
+
+    def add_property_enrichment(self, *, property_id: str, enrichment_key: str, value: Any, source: str, retrieval_date: str, confidence_score: int, success: bool = True, error_message: str | None = None, raw_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        if not isinstance(property_id, str) or not property_id.strip() or not isinstance(enrichment_key, str) or not enrichment_key.strip():
+            return {}
+        payload = {
+            "property_id": property_id.strip(),
+            "enrichment_key": enrichment_key.strip(),
+            "value": value,
+            "source": source or "unknown",
+            "retrieval_date": retrieval_date,
+            "confidence_score": max(0, min(100, int(confidence_score or 0))),
+            "success": bool(success),
+            "error_message": error_message,
+            "raw_payload": raw_payload or {},
+        }
+        return self._insert_row("property_enrichments", payload)
+
+    def batch_upsert_property_enrichments(self, *, property_id: str, enrichments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not isinstance(property_id, str) or not property_id.strip():
+            return []
+        inserted: list[dict[str, Any]] = []
+        for enrichment in enrichments:
+            if not isinstance(enrichment, dict):
+                continue
+            row = self.add_property_enrichment(
+                property_id=property_id.strip(),
+                enrichment_key=str(enrichment.get("enrichment_key") or ""),
+                value=enrichment.get("value"),
+                source=str(enrichment.get("source") or "unknown"),
+                retrieval_date=str(enrichment.get("retrieval_date") or _utc_now_iso()),
+                confidence_score=int(enrichment.get("confidence_score") or 0),
+                success=bool(enrichment.get("success", True)),
+                error_message=enrichment.get("error_message"),
+                raw_payload=enrichment.get("raw_payload") or {},
+            )
+            if row:
+                inserted.append(row)
+        return inserted
 
     def add_listing_snapshot_if_changed(self, *, listing_id: str, snapshot: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(listing_id, str) or not listing_id.strip():
@@ -445,9 +603,9 @@ class DatabaseService:
             "title": snapshot.get("title"),
             "description": snapshot.get("description"),
             "surface_m2": snapshot.get("surface_m2"),
-            "features": snapshot.get("features") or {},
+            "features": _json_safe_value(snapshot.get("features") or {}),
             "content_hash": current_hash,
-            "raw_payload": snapshot.get("raw_payload") or {},
+            "raw_payload": _json_safe_value(snapshot.get("raw_payload") or {}),
         }
         inserted = self._insert_row("listing_snapshots", payload)
 
@@ -647,6 +805,65 @@ class DatabaseService:
             client.table("energy_labels").update({"is_current": False}).eq("property_id", property_id).eq("is_current", True).execute()
             client.table("energy_labels").insert(energy_label_payload).execute()
 
+        try:
+            from services.property_enrichment import PropertyEnrichmentEngine
+
+            enrichment_engine = PropertyEnrichmentEngine()
+            enrichment_result = enrichment_engine.enrich(
+                Property(
+                    source_url=source_url,
+                    title=property_payload.get("title"),
+                    address=property_payload.get("address"),
+                    city=property_payload.get("city"),
+                    postal_code=property_payload.get("postal_code"),
+                    municipality=property_payload.get("municipality"),
+                    asking_price=property_payload.get("asking_price"),
+                    surface_m2=property_payload.get("surface_m2"),
+                    plot_size_m2=property_payload.get("plot_size_m2"),
+                    property_type=property_payload.get("property_type"),
+                    construction_year=property_payload.get("construction_year"),
+                    energy_label=extracted.get("energy_label"),
+                    description=extracted.get("description"),
+                    raw_text=extracted.get("raw_text"),
+                    listing_id=str(property_id),
+                )
+            )
+            client.table("property_enrichment_groups").upsert(
+                {
+                    "property_id": property_id,
+                    "status": "completed",
+                    "started_at": enrichment_result.started_at,
+                    "completed_at": enrichment_result.completed_at,
+                    "source": source_url,
+                    "warning_count": sum(1 for item in enrichment_result.items if not item.success),
+                    "error_count": sum(1 for item in enrichment_result.items if not item.success),
+                    "summary": {"enrichment_count": len(enrichment_result.items)},
+                },
+                on_conflict="property_id",
+            ).execute()
+            if enrichment_result.items:
+                client.table("property_enrichments").insert(
+                    [
+                        {
+                            "property_id": property_id,
+                            "enrichment_key": item.enrichment_key,
+                            "value": item.value,
+                            "source": item.source,
+                            "retrieval_date": item.retrieval_date,
+                            "confidence_score": item.confidence_score,
+                            "success": item.success,
+                            "error_message": item.error_message,
+                            "raw_payload": item.raw_payload,
+                        }
+                        for item in enrichment_result.items
+                    ]
+                ).execute()
+            property_updates = getattr(enrichment_result, "to_property_updates", lambda: {})()
+            if property_updates:
+                client.table("properties").update(property_updates).eq("id", property_id).execute()
+        except Exception:
+            pass
+
         return str(property_id)
 
     def _build_property_payload(self, source_url: str, extracted: dict[str, Any]) -> dict[str, Any]:
@@ -659,6 +876,24 @@ class DatabaseService:
             "asking_price": extracted.get("asking_price"),
             "asking_price_status": extracted.get("asking_price_status") or "unknown",
             "asking_price_text": extracted.get("asking_price_text"),
+            "postal_code": extracted.get("postal_code"),
+            "municipality": extracted.get("municipality"),
+            "bag_id": extracted.get("bag_id"),
+            "bag_nummeraanduiding_id": extracted.get("bag_nummeraanduiding_id"),
+            "bag_pand_id": extracted.get("bag_pand_id"),
+            "bag_building_year": extracted.get("bag_building_year"),
+            "bag_usage_purpose": extracted.get("bag_usage_purpose"),
+            "bag_official_floor_area_m2": extracted.get("bag_official_floor_area_m2"),
+            "bag_coordinates_rd": extracted.get("bag_coordinates_rd"),
+            "bag_coordinates_ll": extracted.get("bag_coordinates_ll"),
+            "bag_postcode": extracted.get("bag_postcode"),
+            "bag_municipality": extracted.get("bag_municipality"),
+            "woz_object_number": extracted.get("woz_object_number"),
+            "latest_woz_value": extracted.get("latest_woz_value"),
+            "woz_valuation_year": extracted.get("woz_valuation_year"),
+            "woz_historical_values": extracted.get("woz_historical_values") or [],
+            "neighborhood_m2_price_average": extracted.get("neighborhood_m2_price_average"),
+            "street_m2_price_average": extracted.get("street_m2_price_average"),
             "listed_since": extracted.get("listed_since"),
             "days_on_market": extracted.get("days_on_market"),
             "listing_status": extracted.get("listing_status") or "unknown",

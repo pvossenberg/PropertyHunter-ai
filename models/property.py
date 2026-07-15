@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
-from typing import Optional
+from datetime import date, datetime
+from typing import Any, Optional
 
 from .permit import PermitRecord
 from .transaction import PropertyTransaction
@@ -21,6 +21,24 @@ class Property:
     asking_price: Optional[float] = None
     asking_price_status: str = "unknown"
     asking_price_text: Optional[str] = None
+    postal_code: Optional[str] = None
+    municipality: Optional[str] = None
+    bag_id: Optional[str] = None
+    bag_nummeraanduiding_id: Optional[str] = None
+    bag_pand_id: Optional[str] = None
+    bag_building_year: Optional[int] = None
+    bag_usage_purpose: Optional[str] = None
+    bag_official_floor_area_m2: Optional[float] = None
+    bag_coordinates_rd: Optional[dict[str, float]] = None
+    bag_coordinates_ll: Optional[dict[str, float]] = None
+    bag_postcode: Optional[str] = None
+    bag_municipality: Optional[str] = None
+    woz_object_number: Optional[int] = None
+    latest_woz_value: Optional[float] = None
+    woz_valuation_year: Optional[int] = None
+    woz_historical_values: list[dict[str, Any]] = field(default_factory=list)
+    neighborhood_m2_price_average: Optional[float] = None
+    street_m2_price_average: Optional[float] = None
     listed_since: Optional[date] = None
     days_on_market: Optional[int] = None
     listing_status: str = "unknown"
@@ -32,10 +50,26 @@ class Property:
     total_price_reduction_percentage: Optional[float] = None
     listing_history_source: Optional[str] = None
     listing_history_confidence: str = "unknown"
+    first_seen_date: Optional[date] = None
+    latest_seen_date: Optional[date] = None
+    number_of_price_changes: Optional[int] = None
+    reduction_frequency: Optional[float] = None
+    recently_relisted: Optional[bool] = None
+    relisted_date: Optional[date] = None
+    price_history: list[dict[str, Any]] = field(default_factory=list)
     surface_m2: Optional[float] = None
+    plot_size_m2: Optional[float] = None
     price_per_m2: Optional[float] = None
+    bedrooms: Optional[int] = None
     annual_rent: Optional[float] = None
     property_type: Optional[str] = None
+    construction_year: Optional[int] = None
+    broker: Optional[str] = None
+    photos: list[str] = field(default_factory=list)
+    listing_id: Optional[str] = None
+    scraped_at: Optional[datetime] = None
+    source_timestamp: Optional[str] = None
+    external_listing_id: Optional[str] = None
     current_use: Optional[str] = None
     zoning: Optional[str] = None
     energy_label: Optional[str] = None

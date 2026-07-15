@@ -30,6 +30,18 @@ create table if not exists public.listings (
     listing_status text not null default 'active',
     first_seen_at timestamptz not null default timezone('utc', now()),
     last_seen_at timestamptz not null default timezone('utc', now()),
+    first_seen_date date,
+    latest_seen_date date,
+    days_on_market integer,
+    original_asking_price numeric,
+    current_asking_price numeric,
+    total_price_reduction_amount numeric,
+    total_price_reduction_percentage numeric,
+    price_reduction_count integer not null default 0,
+    reduction_frequency numeric,
+    price_history jsonb not null default '[]'::jsonb,
+    recently_relisted boolean not null default false,
+    relisted_date date,
     is_active boolean not null default true,
     raw_payload jsonb not null default '{}'::jsonb,
     created_at timestamptz not null default timezone('utc', now()),
@@ -100,6 +112,40 @@ create table if not exists public.deal_candidates (
 create index if not exists idx_deal_candidates_listing_id on public.deal_candidates (listing_id);
 create index if not exists idx_deal_candidates_review_status on public.deal_candidates (review_status);
 create index if not exists idx_deal_candidates_priority on public.deal_candidates (priority);
+
+create table if not exists public.property_enrichments (
+    id uuid primary key default gen_random_uuid(),
+    property_id uuid not null references public.properties(id) on delete cascade,
+    enrichment_key text not null,
+    value jsonb,
+    source text not null,
+    retrieval_date timestamptz not null default timezone('utc', now()),
+    confidence_score integer not null default 0,
+    success boolean not null default true,
+    error_message text,
+    raw_payload jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default timezone('utc', now())
+);
+
+create index if not exists idx_property_enrichments_property_id on public.property_enrichments (property_id);
+create index if not exists idx_property_enrichments_enrichment_key on public.property_enrichments (enrichment_key);
+create index if not exists idx_property_enrichments_created_at on public.property_enrichments (created_at desc);
+
+create table if not exists public.property_enrichment_groups (
+    id uuid primary key default gen_random_uuid(),
+    property_id uuid not null references public.properties(id) on delete cascade unique,
+    status text not null default 'pending',
+    started_at timestamptz,
+    completed_at timestamptz,
+    source text,
+    warning_count integer not null default 0,
+    error_count integer not null default 0,
+    summary jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default timezone('utc', now())
+);
+
+create index if not exists idx_property_enrichment_groups_property_id on public.property_enrichment_groups (property_id);
+create index if not exists idx_property_enrichment_groups_status on public.property_enrichment_groups (status);
 
 create or replace function public.set_updated_at()
 returns trigger

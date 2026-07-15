@@ -3,7 +3,9 @@ from unittest.mock import patch
 
 from deal_finder.deduplication import match_listing, normalize_text, normalize_url, parse_address_components
 from deal_finder.models import NormalizedListing
+from deal_finder.orchestrator import DealFinderOrchestrator
 from deal_finder.ranking import rank_listing
+from deal_finder.sources.base import SourceRecordResult
 from deal_finder.sources.manual_import import ManualImportAdapter
 from services.database import DatabaseService
 
@@ -278,6 +280,60 @@ class DealFinderFoundationTests(unittest.TestCase):
             self.assertEqual(len(listings), 1)
             self.assertEqual(warnings, [])
             mocked_get.assert_not_called()
+
+    def test_ingest_refreshes_listing_history_summary(self):
+        db = InMemoryDatabaseService()
+        orchestrator = DealFinderOrchestrator(database_service=db)
+
+        first_result = SourceRecordResult(
+            record_index=0,
+            success=True,
+            listing=NormalizedListing(
+                source_name="manual",
+                source_url="https://example.com/history-1",
+                external_listing_id="history-1",
+                title="History Object",
+                address="Straat 1",
+                city="Amsterdam",
+                asking_price=200000,
+                surface_m2=50,
+                property_type="woning",
+                description="First snapshot",
+                listing_status="active",
+                raw_payload={},
+            ),
+        )
+        second_result = SourceRecordResult(
+            record_index=1,
+            success=True,
+            listing=NormalizedListing(
+                source_name="manual",
+                source_url="https://example.com/history-1",
+                external_listing_id="history-1",
+                title="History Object",
+                address="Straat 1",
+                city="Amsterdam",
+                asking_price=180000,
+                surface_m2=50,
+                property_type="woning",
+                description="Second snapshot",
+                listing_status="active",
+                raw_payload={},
+            ),
+        )
+
+        first_ingest = orchestrator._ingest_source_results(source_id=None, source_name="manual", results=[first_result])
+        second_ingest = orchestrator._ingest_source_results(source_id=None, source_name="manual", results=[second_result])
+
+        self.assertEqual(first_ingest["imported"], 1)
+        self.assertEqual(second_ingest["imported"], 1)
+
+        listing_row = db._tables["listings"][0]
+        self.assertEqual(listing_row.get("current_asking_price"), 180000)
+        self.assertEqual(listing_row.get("original_asking_price"), 200000)
+        self.assertEqual(listing_row.get("price_reduction_count"), 1)
+        self.assertEqual(listing_row.get("days_on_market"), 0)
+        self.assertEqual(len(listing_row.get("price_history") or []), 2)
 
     def test_deduplication_methods(self):
         incoming = NormalizedListing(
