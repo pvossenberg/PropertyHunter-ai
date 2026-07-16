@@ -1,14 +1,178 @@
 import unittest
 
 from app import (
+    _deal_recommendation_from_score,
+    _build_rows_from_scan_properties,
     _build_propertyhunter_rows,
     _filter_propertyhunter_rows,
     _latest_scan_metrics,
     _propertyhunter_listing_history_text,
+    _score_rows_with_opportunity_intelligence,
+    _sort_deal_intelligence_rows,
+    _woz_metrics,
+    _woz_pct_badge,
 )
 
 
 class PropertyHunterInterfaceHelpersTests(unittest.TestCase):
+    def test_woz_metrics_handles_missing_and_calculates_difference(self):
+        self.assertEqual(_woz_metrics(None, 400000), (None, None))
+        self.assertEqual(_woz_metrics(500000, None), (None, None))
+        self.assertEqual(_woz_metrics(500000, 0), (None, None))
+        self.assertEqual(_woz_metrics(500000, 400000), (100000.0, 25.0))
+
+    def test_woz_pct_badge_color_thresholds(self):
+        self.assertIn("#2E7D32", _woz_pct_badge(-2.0))
+        self.assertIn("#EF6C00", _woz_pct_badge(8.0))
+        self.assertIn("#C62828", _woz_pct_badge(15.0))
+        self.assertIn("Niet beschikbaar", _woz_pct_badge(None))
+
+    def test_deal_recommendation_scale(self):
+        self.assertEqual(_deal_recommendation_from_score(90), "★★★★★ Exceptional")
+        self.assertEqual(_deal_recommendation_from_score(75), "★★★★ Strong Buy")
+        self.assertEqual(_deal_recommendation_from_score(60), "★★★ Consider")
+        self.assertEqual(_deal_recommendation_from_score(45), "★★ Weak")
+        self.assertEqual(_deal_recommendation_from_score(10), "★ Avoid")
+
+    def test_score_rows_adds_deal_intelligence_pro_fields(self):
+        rows = [
+            {
+                "adres": "Markt 1",
+                "plaats": "Breda",
+                "vraagprijs": 350000,
+                "woonoppervlak": 125,
+                "perceel": 190,
+                "slaapkamers": 4,
+                "energielabel": "C",
+                "bouwjaar": 1988,
+                "days_on_market": 72,
+                "price_reduction_count": 2,
+                "price_per_m2": None,
+                "investment_score": None,
+                "opportunity_score": None,
+            },
+            {
+                "adres": "Markt 2",
+                "plaats": "Breda",
+                "vraagprijs": 540000,
+                "woonoppervlak": 105,
+                "perceel": 120,
+                "slaapkamers": 2,
+                "energielabel": "A",
+                "bouwjaar": 2005,
+                "days_on_market": 15,
+                "price_reduction_count": 0,
+                "price_per_m2": None,
+                "investment_score": None,
+                "opportunity_score": None,
+            },
+        ]
+
+        scored = _score_rows_with_opportunity_intelligence(rows)
+        first = scored[0]
+
+        self.assertIn("city_avg_price_per_m2", first)
+        self.assertIn("difference_vs_city_avg_pct", first)
+        self.assertIn("split_potential", first)
+        self.assertIn("vertical_extension_potential", first)
+        self.assertIn("rental_potential", first)
+        self.assertIn("renovation_potential", first)
+        self.assertIn("overall_investment_score", first)
+        self.assertIn("investment_recommendation", first)
+
+        self.assertGreaterEqual(first["split_potential"], 0)
+        self.assertLessEqual(first["split_potential"], 100)
+        self.assertGreaterEqual(first["vertical_extension_potential"], 0)
+        self.assertLessEqual(first["vertical_extension_potential"], 100)
+        self.assertGreaterEqual(first["rental_potential"], 0)
+        self.assertLessEqual(first["rental_potential"], 100)
+        self.assertGreaterEqual(first["renovation_potential"], 0)
+        self.assertLessEqual(first["renovation_potential"], 100)
+
+    def test_sort_deal_intelligence_rows_by_new_scores(self):
+        rows = [
+            {"adres": "A", "split_potential": 30, "rental_potential": 20, "deal_score": 50},
+            {"adres": "B", "split_potential": 80, "rental_potential": 60, "deal_score": 70},
+            {"adres": "C", "split_potential": 55, "rental_potential": 90, "deal_score": 40},
+        ]
+
+        sorted_split = _sort_deal_intelligence_rows(rows, "Hoogste split potential")
+        sorted_rental = _sort_deal_intelligence_rows(rows, "Hoogste rental potential")
+
+        self.assertEqual(sorted_split[0]["adres"], "B")
+        self.assertEqual(sorted_rental[0]["adres"], "C")
+
+    def test_build_rows_from_scan_properties_populates_missing_fields_from_raw_data(self):
+        properties = [
+            {
+                "property": {
+                    "address": "Fallbackstraat 10",
+                    "city": "Breda",
+                    "asking_price": 325000,
+                    "source_url": "https://www.funda.nl/detail/koop/breda/object/123/",
+                    "raw_extracted_data": {
+                        "living_area": 118,
+                        "energy_label": "B",
+                        "construction_year": 2001,
+                        "plot_size": 164,
+                        "bedrooms": 4,
+                    },
+                }
+            }
+        ]
+
+        rows = _build_rows_from_scan_properties(properties)
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["woonoppervlak"], 118.0)
+        self.assertEqual(row["energielabel"], "B")
+        self.assertEqual(row["bouwjaar"], 2001)
+        self.assertEqual(row["perceel"], 164.0)
+        self.assertEqual(row["slaapkamers"], 4)
+
+    def test_opportunity_scoring_is_clamped_and_prefers_better_candidate(self):
+        rows = [
+            {
+                "adres": "Kansstraat 1",
+                "plaats": "Breda",
+                "vraagprijs": 250000,
+                "woonoppervlak": 120,
+                "perceel": 180,
+                "slaapkamers": 4,
+                "energielabel": "A",
+                "bouwjaar": 2000,
+                "price_reduction_count": 1,
+                "price_per_m2": None,
+                "investment_score": None,
+                "opportunity_score": None,
+            },
+            {
+                "adres": "Duurstraat 2",
+                "plaats": "Breda",
+                "vraagprijs": 620000,
+                "woonoppervlak": 100,
+                "perceel": 120,
+                "slaapkamers": 2,
+                "energielabel": "D",
+                "bouwjaar": 1980,
+                "price_reduction_count": 0,
+                "price_per_m2": None,
+                "investment_score": 130,
+                "opportunity_score": -10,
+            },
+        ]
+
+        scored = _score_rows_with_opportunity_intelligence(rows)
+
+        self.assertEqual(scored[0]["investment_score"], 100)
+        self.assertGreaterEqual(scored[0]["opportunity_score"], 0)
+        self.assertLessEqual(scored[0]["opportunity_score"], 100)
+
+        self.assertEqual(scored[1]["investment_score"], 100)
+        self.assertEqual(scored[1]["opportunity_score"], 0)
+        self.assertGreater(scored[0]["opportunity_score"], scored[1]["opportunity_score"])
+
     def test_build_rows_maps_required_columns_from_listing_and_payload(self):
         candidates = [
             {

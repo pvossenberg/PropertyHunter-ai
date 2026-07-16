@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 import time
 from typing import Any
+from urllib.parse import urlencode
 
 import streamlit as st
 import requests
@@ -21,6 +22,7 @@ from models.transaction import PropertyTransaction
 from scrapers.base import ScrapeResult
 from scrapers.router import scrape_url
 from services.calculations import calculate_days_on_market, calculate_price_change_since_last_transaction, calculate_price_per_m2, calculate_price_reduction
+from services.dashboard_service import DashboardService
 from services.comparable_sales import ComparableSalesService
 from services.database import DatabaseService
 from services.end_to_end_workflow import PropertyHunterEndToEndWorkflow
@@ -30,6 +32,7 @@ from services.property_enrichment import PropertyEnrichmentEngine
 DATABASE_SERVICE = DatabaseService.from_env()
 DEAL_FINDER_ORCHESTRATOR = DealFinderOrchestrator(DATABASE_SERVICE)
 COMPARABLE_SALES_SERVICE = ComparableSalesService()
+DASHBOARD_SERVICE = DashboardService(DATABASE_SERVICE)
 PROPERTY_ENRICHMENT_ENGINE = PropertyEnrichmentEngine()
 PROPERTY_HUNTER_WORKFLOW = PropertyHunterEndToEndWorkflow(
     orchestrator=DEAL_FINDER_ORCHESTRATOR,
@@ -170,6 +173,7 @@ def _run_source_scan(
     orchestrator: DealFinderOrchestrator | None = None,
     database_service: DatabaseService | None = None,
     output_dir: Path | None = None,
+    start_url: str | None = None,
     max_pages: int = 1000,
     timeout_seconds: float = 12.0,
 ) -> dict[str, Any]:
@@ -184,7 +188,7 @@ def _run_source_scan(
         return {"ok": False, "error": error}
 
     configuration = {
-        "start_url": getattr(adapter, "default_start_url", "") or "",
+        "start_url": str(start_url or getattr(adapter, "default_start_url", "") or "").strip(),
         "max_pages": max_pages,
         "timeout_seconds": timeout_seconds,
     }
@@ -532,6 +536,17 @@ def _format_number(value):
     return f"{integer_value:,}".replace(",", ".")
 
 
+def _format_dashboard_timestamp(value: str | None) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return "Onbekend"
+    text = value.strip()
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
 def _to_display_text(value) -> str:
     if value in (None, ""):
         return ""
@@ -554,7 +569,11 @@ def _render_rows_with_columns(rows: list[dict], columns: list[tuple[str, str]], 
     for row in rows:
         value_columns = st.columns(len(columns))
         for index, (_, key) in enumerate(columns):
-            value_columns[index].write(_to_display_text(row.get(key)))
+            value = row.get(key)
+            if isinstance(value, str) and value.strip().lower().startswith("<span"):
+                value_columns[index].markdown(value, unsafe_allow_html=True)
+            else:
+                value_columns[index].write(_to_display_text(value))
 
 
 def _render_deal_candidate_cards(candidates: list[dict]):
@@ -562,26 +581,212 @@ def _render_deal_candidate_cards(candidates: list[dict]):
         st.info("Geen deal candidates gevonden voor de gekozen filters.")
         return
 
-    for item in candidates:
-        listing = item.get("listing") or {}
-        source = item.get("source") or {}
-        title = listing.get("title") or "Onbekend"
-        address = listing.get("address") or "Onbekend"
-        city = listing.get("city") or "Onbekend"
-        asking_price = _format_currency(listing.get("asking_price"))
-        surface_value = listing.get("surface_m2")
-        surface_text = f"{_format_number(surface_value)} m²" if surface_value not in (None, "") else "Onbekend"
-        score_text = item.get("score") if item.get("score") is not None else "n.v.t."
-        priority = item.get("priority") or "n.v.t."
-        source_name = source.get("name") or "Onbekend"
-        review_status = item.get("review_status") or "new"
 
-        with st.container(border=True):
-            st.markdown(f"**{title}**")
-            st.write(f"{address} · {city}")
-            st.write(f"Vraagprijs: {asking_price}")
-            st.write(f"Oppervlakte: {surface_text}")
-            st.write(f"Score: {score_text} | Priority: {priority} | Bron: {source_name} | Review status: {review_status}")
+def _clamp_score_0_100(value: Any) -> int | None:
+    numeric = _safe_score(value)
+    if numeric is None:
+        return None
+    return max(0, min(100, int(numeric)))
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _extract_previous_asking_prices(snapshots: list[dict[str, Any]], current_price: float | None) -> list[float]:
+    prices: list[float] = []
+    for snapshot in snapshots:
+        if not isinstance(snapshot, dict):
+            continue
+        value = _safe_number(snapshot.get("asking_price"))
+        if value is None or value <= 0:
+            continue
+        prices.append(round(value, 2))
+
+    if not prices:
+        return []
+
+    previous = prices[:-1] if len(prices) > 1 else []
+    if current_price is not None:
+        previous = [value for value in previous if abs(float(value) - float(current_price)) > 0.009]
+
+    deduped: list[float] = []
+    for value in previous:
+        if deduped and abs(deduped[-1] - value) <= 0.009:
+            continue
+        deduped.append(value)
+    return deduped
+
+
+def _format_price_history(values: list[float]) -> str:
+    if not values:
+        return "Onbekend"
+    return " -> ".join(_format_currency(value) for value in values)
+
+
+def _woz_metrics(asking_price: float | None, woz_value: float | None) -> tuple[float | None, float | None]:
+    if asking_price is None or woz_value in (None, 0):
+        return None, None
+    difference_eur = round(float(asking_price) - float(woz_value), 2)
+    difference_pct = round(((float(asking_price) - float(woz_value)) / float(woz_value)) * 100.0, 2)
+    return difference_eur, difference_pct
+
+
+def _woz_pct_badge(value: float | None) -> str:
+    if value is None:
+        return "<span style='background:#757575;color:#FFFFFF;padding:2px 8px;border-radius:12px;font-weight:700;'>Niet beschikbaar</span>"
+    if value < 0:
+        color = "#2E7D32"
+    elif value <= 10:
+        color = "#EF6C00"
+    else:
+        color = "#C62828"
+    return f"<span style='background:{color};color:#FFFFFF;padding:2px 8px;border-radius:12px;font-weight:700;'>{_format_percentage(value, decimals=2)}</span>"
+
+
+def _derive_price_reduction_count(row: dict[str, Any], snapshots: list[dict[str, Any]]) -> int:
+    explicit = _safe_score(row.get("price_reduction_count"))
+    if explicit is not None and explicit >= 0:
+        return int(explicit)
+
+    price_points = [
+        _safe_number(snapshot.get("asking_price"))
+        for snapshot in snapshots
+        if isinstance(snapshot, dict) and _safe_number(snapshot.get("asking_price")) is not None
+    ]
+    reductions = 0
+    for previous, current in zip(price_points, price_points[1:]):
+        if previous is not None and current is not None and current < previous:
+            reductions += 1
+    return reductions
+
+
+def _derive_days_on_market(row: dict[str, Any], listing: dict[str, Any], snapshots: list[dict[str, Any]]) -> int | None:
+    explicit = _safe_score(row.get("days_on_market"))
+    if explicit is not None:
+        return explicit
+
+    listed_since = _listing_value(listing, "listed_since")
+    calculated = calculate_days_on_market(listed_since) if listed_since not in (None, "") else None
+    if calculated is not None:
+        return calculated
+
+    observed_dates = [
+        _parse_iso_datetime(snapshot.get("observed_at"))
+        for snapshot in snapshots
+        if isinstance(snapshot, dict)
+    ]
+    observed_dates = [value for value in observed_dates if value is not None]
+    if not observed_dates:
+        return None
+    oldest = min(observed_dates)
+    return calculate_days_on_market(oldest.date().isoformat())
+
+
+def _deal_recommendation_from_score(score: int | None) -> str:
+    if score is None:
+        return "★ Avoid"
+    if score >= 85:
+        return "★★★★★ Exceptional"
+    if score >= 70:
+        return "★★★★ Strong Buy"
+    if score >= 55:
+        return "★★★ Consider"
+    if score >= 40:
+        return "★★ Weak"
+    return "★ Avoid"
+
+
+def _sort_deal_intelligence_rows(rows: list[dict[str, Any]], sort_choice: str) -> list[dict[str, Any]]:
+    result = list(rows)
+    numeric_desc_keys = {
+        "Hoogste deal score": "deal_score",
+        "Hoogste investment score": "investment_score",
+        "Hoogste opportunity score": "opportunity_score",
+        "Hoogste split potential": "split_potential",
+        "Hoogste vertical extension potential": "vertical_extension_potential",
+        "Hoogste rental potential": "rental_potential",
+        "Hoogste renovation potential": "renovation_potential",
+    }
+
+    if sort_choice in numeric_desc_keys:
+        key_name = numeric_desc_keys[sort_choice]
+        result.sort(key=lambda item: _safe_number(item.get(key_name)) if _safe_number(item.get(key_name)) is not None else -1, reverse=True)
+    elif sort_choice == "Laagste vraagprijs":
+        result.sort(key=lambda item: _safe_number(item.get("vraagprijs")) if _safe_number(item.get("vraagprijs")) is not None else float("inf"))
+    elif sort_choice == "Hoogste vraagprijs":
+        result.sort(key=lambda item: _safe_number(item.get("vraagprijs")) if _safe_number(item.get("vraagprijs")) is not None else -1, reverse=True)
+    elif sort_choice == "Nieuwste":
+        result.sort(key=lambda item: str(item.get("detected_at") or ""), reverse=True)
+
+    return result
+
+
+def _build_deal_intelligence_rows(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = _build_propertyhunter_rows(candidates)
+    if not rows:
+        return []
+
+    candidate_by_listing_id = {
+        str(((candidate.get("listing") or {}).get("id") or "")).strip(): candidate
+        for candidate in candidates
+        if isinstance(candidate, dict)
+    }
+
+    for row in rows:
+        listing_id = str(row.get("listing_id") or "").strip()
+        candidate = candidate_by_listing_id.get(listing_id, {})
+        listing = candidate.get("listing") if isinstance(candidate.get("listing"), dict) else {}
+        snapshots = DATABASE_SERVICE.get_listing_snapshots(listing_id, limit=25) if listing_id else []
+
+        current_price = _safe_number(row.get("vraagprijs"))
+        previous_prices = _extract_previous_asking_prices(snapshots, current_price)
+        row["vorige_vraagprijzen"] = _format_price_history(previous_prices)
+        row["price_reduction_count"] = _derive_price_reduction_count(row, snapshots)
+        row["days_on_market"] = _derive_days_on_market(row, listing, snapshots)
+        row["deal_score"] = _clamp_score_0_100(candidate.get("score"))
+        row["detected_at"] = candidate.get("detected_at")
+
+        raw_payload = listing.get("raw_payload") if isinstance(listing.get("raw_payload"), dict) else {}
+        woz_value = _safe_number(raw_payload.get("latest_woz_value") or listing.get("latest_woz_value"))
+        woz_valuation_year = _safe_score(raw_payload.get("woz_valuation_year") or listing.get("woz_valuation_year"))
+        bag_id = str(raw_payload.get("bag_id") or "").strip() or None
+        woz_source = str(raw_payload.get("woz_source") or "").strip() or None
+        woz_retrieval_date = str(raw_payload.get("woz_retrieval_date") or "").strip() or None
+
+        row["woz_value"] = woz_value
+        row["woz_valuation_year"] = woz_valuation_year
+        row["bag_id"] = bag_id
+        row["woz_source"] = woz_source
+        row["woz_retrieval_date"] = woz_retrieval_date
+
+        diff_eur, diff_pct = _woz_metrics(current_price, woz_value)
+        row["asking_price_minus_woz_value"] = diff_eur
+        row["asking_price_vs_woz_percentage"] = diff_pct
+
+    return _score_rows_with_opportunity_intelligence(rows)
+
+
+def _latest_scan_metrics(health_payload: dict[str, Any]) -> dict[str, int]:
+    runs = health_payload.get("latest_scan_runs") if isinstance(health_payload, dict) else []
+    if not isinstance(runs, list) or not runs:
+        return {"found": 0, "new": 0, "changed": 0}
+
+    latest = max(
+        [item for item in runs if isinstance(item, dict)],
+        key=lambda item: str(item.get("started_at") or item.get("created_at") or ""),
+        default={},
+    )
+    return {
+        "found": int(_safe_score(latest.get("items_found")) or 0),
+        "new": int(_safe_score(latest.get("items_new")) or 0),
+        "changed": int(_safe_score(latest.get("items_changed")) or 0),
+    }
 
 
 def _clear_deal_finder_refresh_state():
@@ -663,6 +868,8 @@ def _build_propertyhunter_rows(candidates: list[dict[str, Any]]) -> list[dict[st
                 "slaapkamers": _safe_score(_listing_value(listing, "bedrooms")),
                 "energielabel": str(_listing_value(listing, "energy_label") or "Onbekend"),
                 "bouwjaar": _safe_score(_listing_value(listing, "construction_year", "bag_building_year")),
+                "price_per_m2": _safe_number(_listing_value(listing, "price_per_m2")),
+                "price_reduction_count": _safe_score(_listing_value(listing, "price_reduction_count")),
                 "days_on_market": _safe_score(_listing_value(listing, "days_on_market")),
                 "listing_history": _propertyhunter_listing_history_text(listing),
                 "investment_score": _safe_score(candidate.get("investment_score")),
@@ -709,20 +916,528 @@ def _filter_propertyhunter_rows(
     return filtered
 
 
-def _latest_scan_metrics(health_payload: dict[str, Any]) -> dict[str, int]:
-    runs = health_payload.get("latest_scan_runs") if isinstance(health_payload, dict) else []
-    if not isinstance(runs, list) or not runs:
-        return {"found": 0, "new": 0, "changed": 0}
+def _build_funda_start_url(
+    city: str,
+    *,
+    min_price: int | None,
+    max_price: int | None,
+    min_living_area: int | None,
+) -> str:
+    city_slug = "-".join(part for part in str(city or "").strip().lower().split() if part)
+    if not city_slug:
+        city_slug = "nederland"
 
-    latest = max(
-        [item for item in runs if isinstance(item, dict)],
-        key=lambda item: str(item.get("started_at") or item.get("created_at") or ""),
-        default={},
-    )
+    base_url = "https://www.funda.nl/zoeken/koop/"
+
+    params: dict[str, str] = {
+        "selected_area": json.dumps([city_slug], ensure_ascii=True),
+    }
+    if min_price is not None or max_price is not None:
+        lower = str(int(min_price)) if min_price is not None and int(min_price) > 0 else ""
+        upper = str(int(max_price)) if max_price is not None and int(max_price) > 0 else ""
+        params["price"] = f'"{lower}-{upper}"'
+    if min_living_area is not None and int(min_living_area) > 0:
+        params["floor_area"] = f'"{int(min_living_area)}-"'
+
+    return f"{base_url}?{urlencode(params)}"
+
+
+def _build_rows_from_scan_properties(properties: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in properties:
+        if not isinstance(item, dict):
+            continue
+        property_data = item.get("property") if isinstance(item.get("property"), dict) else {}
+        if not property_data:
+            continue
+
+        raw_extracted = property_data.get("raw_extracted_data") if isinstance(property_data.get("raw_extracted_data"), dict) else {}
+        raw_payload = property_data.get("raw_payload") if isinstance(property_data.get("raw_payload"), dict) else {}
+
+        def value(*keys: str) -> Any:
+            for key in keys:
+                if property_data.get(key) not in (None, ""):
+                    return property_data.get(key)
+                if raw_extracted.get(key) not in (None, ""):
+                    return raw_extracted.get(key)
+                if raw_payload.get(key) not in (None, ""):
+                    return raw_payload.get(key)
+            return None
+
+        rows.append(
+            {
+                "adres": value("address") or "Onbekend",
+                "plaats": value("city") or "Onbekend",
+                "vraagprijs": _safe_number(value("asking_price")),
+                "woonoppervlak": _safe_number(value("surface_m2", "living_area", "bag_official_floor_area_m2")),
+                "perceel": _safe_number(value("plot_size_m2", "plot_size")),
+                "slaapkamers": _safe_score(value("bedrooms")),
+                "energielabel": str(value("energy_label") or "Onbekend"),
+                "bouwjaar": _safe_score(value("construction_year", "bag_building_year")),
+                "price_reduction_count": _safe_score(value("price_reduction_count")),
+                "price_per_m2": _safe_number(value("price_per_m2")),
+                "investment_score": None,
+                "opportunity_score": None,
+                "source_url": str(value("source_url") or ""),
+            }
+        )
+    return rows
+
+
+def _build_rows_from_listing_ids(listing_ids: list[str]) -> tuple[list[dict[str, Any]], int]:
+    rows: list[dict[str, Any]] = []
+    price_reductions = 0
+    seen: set[str] = set()
+
+    for listing_id in listing_ids:
+        normalized_id = str(listing_id or "").strip()
+        if not normalized_id or normalized_id in seen:
+            continue
+        seen.add(normalized_id)
+
+        detail = DATABASE_SERVICE.get_listing_detail(normalized_id)
+        listing = detail.get("listing") if isinstance(detail.get("listing"), dict) else {}
+        if not listing:
+            continue
+
+        source = detail.get("source") if isinstance(detail.get("source"), dict) else {}
+        candidate = detail.get("candidate") if isinstance(detail.get("candidate"), dict) else {}
+
+        if int(_safe_score(listing.get("price_reduction_count")) or 0) > 0:
+            price_reductions += 1
+
+        rows.extend(
+            _build_propertyhunter_rows(
+                [
+                    {
+                        "listing": listing,
+                        "source": source,
+                        "investment_score": _safe_score(candidate.get("investment_score")),
+                        "hidden_value_score": _safe_score(candidate.get("hidden_value_score")),
+                        "score": _safe_score(candidate.get("hidden_value_score")),
+                    }
+                ]
+            )
+        )
+
+    return rows, price_reductions
+
+
+def _compute_row_price_per_m2(row: dict[str, Any]) -> float | None:
+    explicit = _safe_number(row.get("price_per_m2"))
+    if explicit is not None:
+        return explicit
+    price = _safe_number(row.get("vraagprijs"))
+    living_area = _safe_number(row.get("woonoppervlak"))
+    if price is None or living_area in (None, 0):
+        return None
+    return round(price / living_area, 2)
+
+
+def _score_rows_with_opportunity_intelligence(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        city_key = str(row.get("plaats") or "Onbekend").strip().lower()
+        grouped.setdefault(city_key, []).append(row)
+
+    for city_rows in grouped.values():
+        city_prices = [_safe_number(item.get("vraagprijs")) for item in city_rows if _safe_number(item.get("vraagprijs")) is not None]
+        city_ppm2 = [_compute_row_price_per_m2(item) for item in city_rows if _compute_row_price_per_m2(item) is not None]
+        sorted_ppm2 = sorted(float(value) for value in city_ppm2)
+
+        avg_ppm2 = (sum(city_ppm2) / len(city_ppm2)) if city_ppm2 else None
+        sorted_prices = sorted(float(item) for item in city_prices)
+        median_price = None
+        if sorted_prices:
+            middle = len(sorted_prices) // 2
+            if len(sorted_prices) % 2 == 1:
+                median_price = sorted_prices[middle]
+            else:
+                median_price = (sorted_prices[middle - 1] + sorted_prices[middle]) / 2.0
+
+        for row in city_rows:
+            row_price = _safe_number(row.get("vraagprijs"))
+            row_area = _safe_number(row.get("woonoppervlak"))
+            row_plot = _safe_number(row.get("perceel"))
+            row_energy = str(row.get("energielabel") or "").strip().upper()
+            row_year = _safe_score(row.get("bouwjaar"))
+            row_bedrooms = _safe_score(row.get("slaapkamers"))
+            row_days = _safe_score(row.get("days_on_market"))
+            row_reductions = _safe_score(row.get("price_reduction_count")) or 0
+            row_ppm2 = _compute_row_price_per_m2(row)
+            row["price_per_m2"] = row_ppm2
+            row["city_avg_price_per_m2"] = round(avg_ppm2, 2) if avg_ppm2 is not None else None
+            row["difference_vs_city_avg_pct"] = None
+            if row_ppm2 is not None and avg_ppm2 is not None and avg_ppm2 > 0:
+                row["difference_vs_city_avg_pct"] = round(((row_ppm2 - avg_ppm2) / avg_ppm2) * 100.0, 2)
+
+            investment_score = _safe_score(row.get("investment_score"))
+            if investment_score is None:
+                score = 0
+                if row_ppm2 is not None and avg_ppm2 is not None and row_ppm2 < avg_ppm2:
+                    score += 25
+                if row_area is not None and row_area > 100:
+                    score += 20
+                if row_energy in {"A", "A+", "A++", "A+++", "A++++", "B"}:
+                    score += 15
+                if row_year is not None and row_year > 1995:
+                    score += 15
+                if row_price is not None and median_price is not None and row_price < median_price:
+                    score += 15
+                if row_plot is not None and row_plot > 150:
+                    score += 10
+                investment_score = max(0, min(100, score))
+            row["investment_score"] = max(0, min(100, int(investment_score))) if investment_score is not None else None
+            investment_score = row.get("investment_score")
+
+            price_per_m2_percentile = None
+            if row_ppm2 is not None and sorted_ppm2:
+                lower_count = sum(1 for value in sorted_ppm2 if value <= row_ppm2)
+                percentile = (lower_count / len(sorted_ppm2)) * 100.0
+                # Lower price per m² is better, so invert percentile for opportunity component.
+                price_per_m2_percentile = max(0.0, min(100.0, 100.0 - percentile))
+            row["price_per_m2_percentile"] = price_per_m2_percentile
+
+            opportunity_score = _safe_score(row.get("opportunity_score"))
+            if opportunity_score is None:
+                percentile_component = 0.0
+                if price_per_m2_percentile is not None:
+                    percentile_component = (price_per_m2_percentile / 100.0) * 20.0
+
+                completeness_fields = [row_area, row_energy if row_energy and row_energy != "ONBEKEND" else None, row_year, row_plot, row_bedrooms, row_ppm2]
+                completeness_count = sum(1 for value in completeness_fields if value not in (None, "", 0))
+                completeness_component = (completeness_count / len(completeness_fields)) * 15.0
+
+                upside_component = 0.0
+                if int(_safe_score(row.get("price_reduction_count")) or 0) > 0:
+                    upside_component += 5.0
+                if row_year is not None and row_year < 1990:
+                    upside_component += 3.0
+                if row_energy in {"D", "E", "F", "G"}:
+                    upside_component += 2.0
+                upside_component = max(0.0, min(10.0, upside_component))
+
+                calculated = (float(investment_score or 0) * 0.55) + percentile_component + completeness_component + upside_component
+                opportunity_score = max(0, min(100, int(round(calculated))))
+            row["opportunity_score"] = max(0, min(100, int(opportunity_score))) if opportunity_score is not None else None
+
+            diff_pct = _safe_number(row.get("difference_vs_city_avg_pct"))
+
+            split_score = 20
+            if row_area is not None:
+                if row_area >= 140:
+                    split_score += 30
+                elif row_area >= 110:
+                    split_score += 20
+                elif row_area >= 90:
+                    split_score += 10
+            if row_bedrooms is not None:
+                if row_bedrooms >= 4:
+                    split_score += 20
+                elif row_bedrooms >= 3:
+                    split_score += 10
+            if row_plot is not None and row_plot > 180:
+                split_score += 10
+            if row_energy in {"A", "A+", "A++", "A+++", "A++++", "B"}:
+                split_score += 5
+            if row_days is not None and row_days > 60:
+                split_score += 10
+            if diff_pct is not None:
+                if diff_pct <= -10:
+                    split_score += 15
+                elif diff_pct < 0:
+                    split_score += 8
+            split_score = max(0, min(100, split_score))
+
+            vertical_score = 15
+            if row_plot is not None and row_area is not None and row_area > 0:
+                ratio = row_plot / row_area
+                if ratio >= 2.0:
+                    vertical_score += 35
+                elif ratio >= 1.5:
+                    vertical_score += 25
+                elif ratio >= 1.2:
+                    vertical_score += 15
+            if row_year is not None:
+                if row_year < 1980:
+                    vertical_score += 15
+                elif row_year < 2000:
+                    vertical_score += 8
+            if row_plot is not None:
+                if row_plot > 200:
+                    vertical_score += 20
+                elif row_plot > 150:
+                    vertical_score += 12
+            if diff_pct is not None and diff_pct < 0:
+                vertical_score += 10
+            vertical_score = max(0, min(100, vertical_score))
+
+            rental_score = 20
+            if diff_pct is not None:
+                if diff_pct <= -15:
+                    rental_score += 25
+                elif diff_pct < 0:
+                    rental_score += 15
+            if row_area is not None:
+                if 50 <= row_area <= 120:
+                    rental_score += 15
+                elif row_area <= 150:
+                    rental_score += 8
+            if row_bedrooms is not None:
+                if row_bedrooms >= 2:
+                    rental_score += 15
+                elif row_bedrooms == 1:
+                    rental_score += 8
+            if row_energy in {"A", "A+", "A++", "A+++", "A++++", "B", "C"}:
+                rental_score += 10
+            if row_days is not None and row_days > 45:
+                rental_score += 10
+            rental_score = max(0, min(100, rental_score))
+
+            renovation_score = 10
+            if row_year is not None:
+                if row_year < 1980:
+                    renovation_score += 30
+                elif row_year < 1995:
+                    renovation_score += 20
+            if row_energy in {"D", "E", "F", "G"}:
+                renovation_score += 25
+            elif row_energy == "C":
+                renovation_score += 10
+            if row_reductions > 0:
+                renovation_score += min(10, row_reductions * 5)
+            if diff_pct is not None and diff_pct <= -8:
+                renovation_score += 15
+            if row_days is not None and row_days > 60:
+                renovation_score += 10
+            renovation_score = max(0, min(100, renovation_score))
+
+            row["split_potential"] = split_score
+            row["vertical_extension_potential"] = vertical_score
+            row["rental_potential"] = rental_score
+            row["renovation_potential"] = renovation_score
+
+            overall_score = int(
+                round(
+                    (0.35 * float(row.get("investment_score") or 0))
+                    + (0.25 * float(row.get("opportunity_score") or 0))
+                    + (0.15 * float(split_score))
+                    + (0.15 * float(rental_score))
+                    + (0.10 * float(renovation_score))
+                )
+            )
+            overall_score = max(0, min(100, overall_score))
+            row["overall_investment_score"] = overall_score
+            row["investment_recommendation"] = _deal_recommendation_from_score(overall_score)
+
+    return rows
+
+
+def _score_badge(value: Any) -> str:
+    score = _safe_score(value)
+    if score is None:
+        return "<span style='background:#9E9E9E;color:#FFFFFF;padding:2px 8px;border-radius:12px;font-weight:600;'>Onbekend</span>"
+    if score >= 90:
+        color = "#1B5E20"
+    elif score >= 80:
+        color = "#2E7D32"
+    elif score >= 70:
+        color = "#EF6C00"
+    else:
+        color = "#757575"
+    return f"<span style='background:{color};color:#FFFFFF;padding:2px 8px;border-radius:12px;font-weight:700;'>{score}</span>"
+
+
+def _render_opportunity_top_rows(rows: list[dict[str, Any]]):
+    headers = ["Address", "City", "Price", "Living area", "Price per m²", "Investment score", "Opportunity score"]
+    header_cols = st.columns(len(headers))
+    for idx, label in enumerate(headers):
+        header_cols[idx].markdown(f"**{label}**")
+
+    def display(value: Any) -> str:
+        return "Onbekend" if value in (None, "") else str(value)
+
+    for row in rows:
+        cols = st.columns(len(headers))
+        cols[0].write(display(row.get("address")))
+        cols[1].write(display(row.get("city")))
+        cols[2].write(display(row.get("asking_price")))
+        cols[3].write(display(row.get("living_area")))
+        cols[4].write(display(row.get("price_per_m2")))
+        cols[5].markdown(display(row.get("investment_score")), unsafe_allow_html=True)
+        cols[6].markdown(display(row.get("opportunity_score")), unsafe_allow_html=True)
+
+
+def _run_funda_scan_from_ui(
+    *,
+    cities: list[str],
+    min_price: int,
+    max_price: int,
+    min_living_area: int,
+    max_pages_per_city: int,
+    dry_run: bool,
+) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    per_city_results: list[dict[str, Any]] = []
+    all_rows: list[dict[str, Any]] = []
+
+    listings_found = 0
+    listings_imported = 0
+    new_listings = 0
+    changed_listings = 0
+    unchanged_listings = 0
+    failed_listings = 0
+    price_reductions = 0
+
+    selected_cities = [str(city).strip() for city in cities if str(city).strip()]
+    if not selected_cities:
+        raise ValueError("Selecteer minimaal een stad.")
+
+    for city in selected_cities:
+        start_url = _build_funda_start_url(
+            city,
+            min_price=min_price if min_price > 0 else None,
+            max_price=max_price if max_price > 0 else None,
+            min_living_area=min_living_area if min_living_area > 0 else None,
+        )
+
+        if dry_run:
+            city_result = _run_source_scan(
+                "funda",
+                orchestrator=DEAL_FINDER_ORCHESTRATOR,
+                database_service=DatabaseService(),
+                output_dir=Path("output") / "scan-runs",
+                start_url=start_url,
+                max_pages=max(1, int(max_pages_per_city or 1)),
+                timeout_seconds=12.0,
+            )
+            if not city_result.get("ok"):
+                raise RuntimeError(f"Funda dry-run mislukt voor {city}: {city_result.get('error') or 'onbekende fout'}")
+
+            listings_found += int(city_result.get("listings_found") or 0)
+            listings_imported += int(city_result.get("listings_imported") or 0)
+            failed_listings += int(city_result.get("listings_failed") or 0)
+            unchanged_listings += int(city_result.get("listings_imported") or 0)
+
+            city_output_path = str(city_result.get("output_path") or "").strip()
+            city_rows: list[dict[str, Any]] = []
+            city_price_reductions = 0
+            if city_output_path:
+                try:
+                    payload = json.loads(Path(city_output_path).read_text(encoding="utf-8"))
+                    properties = payload.get("properties") if isinstance(payload, dict) else []
+                    if isinstance(properties, list):
+                        city_rows = _build_rows_from_scan_properties(properties)
+                        city_price_reductions = sum(
+                            1
+                            for row in city_rows
+                            if int(_safe_score((row or {}).get("price_reduction_count")) or 0) > 0
+                        )
+                except Exception:
+                    city_rows = []
+                    city_price_reductions = 0
+
+            all_rows.extend(city_rows)
+            price_reductions += city_price_reductions
+            per_city_results.append(
+                {
+                    "city": city,
+                    "mode": "dry-run",
+                    "start_url": start_url,
+                    "result": city_result,
+                    "rows_found": len(city_rows),
+                }
+            )
+            continue
+
+        import_result = DEAL_FINDER_ORCHESTRATOR.import_from_source(
+            "funda",
+            {
+                "start_url": start_url,
+                "max_pages": max(1, int(max_pages_per_city or 1)),
+                "timeout_seconds": 12.0,
+            },
+        )
+        if not import_result.get("ok"):
+            raise RuntimeError(f"Funda-scan mislukt voor {city}: {import_result.get('error') or 'onbekende fout'}")
+
+        city_found = int(import_result.get("listings_found") or 0)
+        city_new = int(import_result.get("new") or 0)
+        city_changed = int(import_result.get("changed") or 0)
+        city_imported = int(import_result.get("listings_imported") or 0)
+        city_failed = int(import_result.get("failed_listings") or 0)
+        city_unchanged = max(0, city_imported - city_new - city_changed)
+
+        listings_found += city_found
+        listings_imported += city_imported
+        new_listings += city_new
+        changed_listings += city_changed
+        failed_listings += city_failed
+        unchanged_listings += city_unchanged
+
+        city_listing_ids = [str(item).strip() for item in (import_result.get("listing_ids") or []) if str(item).strip()]
+        city_rows, city_price_reductions = _build_rows_from_listing_ids(city_listing_ids)
+        all_rows.extend(city_rows)
+        price_reductions += city_price_reductions
+
+        per_city_results.append(
+            {
+                "city": city,
+                "mode": "live",
+                "start_url": start_url,
+                "result": import_result,
+                "rows_found": len(city_rows),
+            }
+        )
+
+    scored_rows = _score_rows_with_opportunity_intelligence(all_rows)
+    sorted_rows = sorted(scored_rows, key=lambda item: _safe_score(item.get("opportunity_score")) or -1, reverse=True)
+    top_rows = sorted_rows[:20]
+    duration_seconds = round(time.perf_counter() - started_at, 3)
+
+    output_payload = {
+        "source": "funda.nl",
+        "mode": "dry-run" if dry_run else "live",
+        "cities": selected_cities,
+        "filters": {
+            "min_price": min_price,
+            "max_price": max_price,
+            "min_living_area": min_living_area,
+            "max_pages_per_city": max_pages_per_city,
+        },
+        "summary": {
+            "listings_found": listings_found,
+            "listings_imported": listings_imported,
+            "new_listings": new_listings,
+            "changed_listings": changed_listings,
+            "unchanged_listings": unchanged_listings,
+            "price_reductions": price_reductions,
+            "failed_listings": failed_listings,
+            "duration_seconds": duration_seconds,
+            "rows_returned": len(top_rows),
+        },
+        "per_city_results": per_city_results,
+        "top_rows": top_rows,
+    }
+    output_path = _write_scan_output(Path("output") / "scan-runs", output_payload)
+
     return {
-        "found": int(_safe_score(latest.get("items_found")) or 0),
-        "new": int(_safe_score(latest.get("items_new")) or 0),
-        "changed": int(_safe_score(latest.get("items_changed")) or 0),
+        "ok": True,
+        "mode": "dry-run" if dry_run else "live",
+        "listings_found": listings_found,
+        "listings_imported": listings_imported,
+        "new_listings": new_listings,
+        "changed_listings": changed_listings,
+        "unchanged_listings": unchanged_listings,
+        "price_reductions": price_reductions,
+        "failed_listings": failed_listings,
+        "duration_seconds": duration_seconds,
+        "output_path": str(output_path),
+        "top_rows": top_rows,
+        "per_city_results": per_city_results,
     }
 
 
@@ -783,102 +1498,61 @@ def _render_propertyhunter_detail_page(listing_id: str):
 def _render_propertyhunter_interface_page():
     st.subheader("PropertyHunter Interface")
 
-    if not DATABASE_SERVICE.is_enabled:
-        st.info("Supabase is niet geconfigureerd. Stel SUPABASE_URL en SUPABASE_SERVICE_ROLE_KEY in om deze interface te gebruiken.")
-        return
-
-    selected_listing_id = str(st.query_params.get("listing_id") or st.session_state.get("ph_selected_listing_id") or "").strip()
-    if selected_listing_id:
-        st.session_state["ph_selected_listing_id"] = selected_listing_id
-
-    active_view = str(st.session_state.get("ph_view") or ("detail" if selected_listing_id else "list"))
-    st.session_state["ph_view"] = active_view
-
-    if active_view == "detail" and selected_listing_id:
-        _render_propertyhunter_detail_page(selected_listing_id)
-        return
-
-    health = DATABASE_SERVICE.get_source_health()
-    metrics = _latest_scan_metrics(health)
-    candidates = DATABASE_SERVICE.list_deal_candidates(limit=2000, sort_by="detected_at_desc")
-    rows = _build_propertyhunter_rows(candidates)
-
-    scored_rows = [row for row in rows if _safe_score(row.get("opportunity_score")) is not None]
-    avg_opportunity = 0.0
-    if scored_rows:
-        avg_opportunity = round(sum(int(_safe_score(row.get("opportunity_score")) or 0) for row in scored_rows) / len(scored_rows), 2)
+    dashboard_result = DASHBOARD_SERVICE.load_latest_completed_scan()
+    rows = [row.to_dict() for row in dashboard_result.properties]
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("Aantal gevonden woningen", metrics.get("found", 0))
+        st.metric("Laatste scan datum", _format_dashboard_timestamp(dashboard_result.scan_timestamp))
     with col2:
-        st.metric("Aantal nieuwe woningen", metrics.get("new", 0))
+        st.metric("Bronnen", len(dashboard_result.source_names))
+        if dashboard_result.source_names:
+            st.caption(", ".join(dashboard_result.source_names))
     with col3:
-        st.metric("Aantal gewijzigde woningen", metrics.get("changed", 0))
+        st.metric("Listings gevonden", dashboard_result.listings_found)
     with col4:
-        st.metric("Gemiddelde Opportunity Score", avg_opportunity)
+        st.metric("Nieuwe listings", dashboard_result.new_listings)
 
-    top_20 = sorted(rows, key=lambda item: int(_safe_score(item.get("opportunity_score")) or -1), reverse=True)[:20]
-    st.markdown("### Top 20 kansen")
-    if top_20:
-        _render_rows_with_columns(
-            rows=[
-                {
-                    "adres": row.get("adres"),
-                    "plaats": row.get("plaats"),
-                    "vraagprijs": _format_currency(row.get("vraagprijs")),
-                    "opportunity_score": row.get("opportunity_score") if row.get("opportunity_score") is not None else "Onbekend",
-                    "investment_score": row.get("investment_score") if row.get("investment_score") is not None else "Onbekend",
-                    "bron": row.get("bron"),
-                }
-                for row in top_20
-            ],
-            columns=[
-                ("Adres", "adres"),
-                ("Plaats", "plaats"),
-                ("Vraagprijs", "vraagprijs"),
-                ("Opportunity score", "opportunity_score"),
-                ("Investment score", "investment_score"),
-                ("Bron", "bron"),
-            ],
-            empty_message="Geen kansen beschikbaar.",
-        )
-    else:
-        st.info("Nog geen kansen beschikbaar.")
+    col5, col6, col7 = st.columns(3)
+    with col5:
+        st.metric("Gewijzigde listings", dashboard_result.changed_listings)
+    with col6:
+        st.metric("Gemiddelde Investment Score", f"{dashboard_result.average_investment_score:.2f}")
+    with col7:
+        st.metric("Gemiddelde Opportunity Score", f"{dashboard_result.average_opportunity_score:.2f}")
+
+    if not rows:
+        st.info("Geen scanresultaten beschikbaar.")
+        return
+
+    places = sorted({str(row.get("city") or "").strip() for row in rows if str(row.get("city") or "").strip()})
+    asking_prices = [_safe_number(row.get("asking_price")) for row in rows if _safe_number(row.get("asking_price")) is not None]
+    living_areas = [_safe_number(row.get("living_area")) for row in rows if _safe_number(row.get("living_area")) is not None]
+
+    min_price_default = int(min(asking_prices)) if asking_prices else 0
+    max_price_default = int(max(asking_prices)) if asking_prices else 0
+    min_area_default = int(min(living_areas)) if living_areas else 0
 
     st.markdown("### Filters")
-    places = sorted({str(row.get("plaats") or "").strip() for row in rows if str(row.get("plaats") or "").strip() and str(row.get("plaats") or "").strip() != "Onbekend"})
-    energy_labels = sorted({str(row.get("energielabel") or "").strip().upper() for row in rows if str(row.get("energielabel") or "").strip() and str(row.get("energielabel") or "").strip().lower() != "onbekend"})
-    prices = [_safe_number(row.get("vraagprijs")) for row in rows if _safe_number(row.get("vraagprijs")) is not None]
-
-    min_price_default = int(min(prices)) if prices else 0
-    max_price_default = int(max(prices)) if prices else 0
-
     filter_col_1, filter_col_2, filter_col_3 = st.columns(3)
     with filter_col_1:
-        selected_place = st.selectbox("Plaats", ["Alle plaatsen", *places], key="ph_filter_place")
-        selected_energy_label = st.selectbox("Energielabel", ["Alle labels", *energy_labels], key="ph_filter_energy")
+        selected_place = st.selectbox("Plaats", ["Alle plaatsen", *places], key="dashboard_filter_place")
+        min_price = st.number_input("Minimale vraagprijs", min_value=0, value=min_price_default, step=1000, key="dashboard_filter_min_price")
     with filter_col_2:
-        min_price = st.number_input("Minimale vraagprijs", min_value=0, value=min_price_default, step=1000, key="ph_filter_min_price")
-        max_price = st.number_input("Maximale vraagprijs", min_value=0, value=max_price_default if max_price_default >= min_price_default else min_price_default, step=1000, key="ph_filter_max_price")
+        max_price = st.number_input("Maximale vraagprijs", min_value=0, value=max_price_default if max_price_default >= min_price_default else min_price_default, step=1000, key="dashboard_filter_max_price")
+        min_surface = st.number_input("Minimaal woonoppervlak", min_value=0, value=min_area_default, step=1, key="dashboard_filter_min_surface")
     with filter_col_3:
-        min_surface = st.number_input("Minimaal woonoppervlak (m²)", min_value=0, value=0, step=1, key="ph_filter_min_surface")
-        min_opportunity_score = st.slider("Minimale opportunity score", min_value=0, max_value=100, value=0, key="ph_filter_min_opp")
+        min_opportunity_score = st.slider("Minimale opportunity score", min_value=0, max_value=100, value=0, key="dashboard_filter_min_opportunity")
 
-    filtered_rows = _filter_propertyhunter_rows(
-        rows,
-        place=None if selected_place == "Alle plaatsen" else selected_place,
-        min_price=float(min_price) if min_price > 0 else None,
-        max_price=float(max_price) if max_price > 0 else None,
-        min_surface=float(min_surface) if min_surface > 0 else None,
-        energy_label=None if selected_energy_label == "Alle labels" else selected_energy_label,
-        min_opportunity_score=int(min_opportunity_score) if min_opportunity_score > 0 else None,
-    )
-
-    st.markdown("### Woningtabel")
-    if not filtered_rows:
-        st.info("Geen woningen gevonden met de huidige filters.")
-        return
+    filtered_rows = [
+        row
+        for row in rows
+        if (selected_place == "Alle plaatsen" or str(row.get("city") or "").strip() == selected_place)
+        and (_safe_number(row.get("asking_price")) is not None and _safe_number(row.get("asking_price")) >= float(min_price))
+        and (_safe_number(row.get("asking_price")) is not None and _safe_number(row.get("asking_price")) <= float(max_price))
+        and (_safe_number(row.get("living_area")) is not None and _safe_number(row.get("living_area")) >= float(min_surface))
+        and (_safe_score(row.get("opportunity_score")) is not None and _safe_score(row.get("opportunity_score")) >= int(min_opportunity_score))
+    ]
 
     filtered_rows.sort(key=lambda item: int(_safe_score(item.get("opportunity_score")) or -1), reverse=True)
 
@@ -887,24 +1561,37 @@ def _render_propertyhunter_interface_page():
         table_rows.append(
             {
                 "listing_id": row.get("listing_id"),
-                "adres": row.get("adres"),
-                "plaats": row.get("plaats"),
-                "vraagprijs": _format_currency(row.get("vraagprijs")),
-                "woonoppervlak": f"{_format_number(row.get('woonoppervlak'))} m²" if row.get("woonoppervlak") not in (None, "") else "Onbekend",
-                "perceel": f"{_format_number(row.get('perceel'))} m²" if row.get("perceel") not in (None, "") else "Onbekend",
-                "slaapkamers": row.get("slaapkamers") if row.get("slaapkamers") is not None else "Onbekend",
-                "energielabel": row.get("energielabel") or "Onbekend",
-                "bouwjaar": row.get("bouwjaar") if row.get("bouwjaar") is not None else "Onbekend",
+                "adres": row.get("address") or "Onbekend",
+                "plaats": row.get("city") or "Onbekend",
+                "vraagprijs": _format_currency(row.get("asking_price")),
+                "woonoppervlak": _format_number(row.get("living_area")),
+                "perceel": _format_number(row.get("plot_size")),
+                "slaapkamers": row.get("bedrooms") if row.get("bedrooms") is not None else "Onbekend",
+                "energielabel": row.get("energy_label") or "Onbekend",
+                "bouwjaar": row.get("construction_year") if row.get("construction_year") is not None else "Onbekend",
                 "days_on_market": row.get("days_on_market") if row.get("days_on_market") is not None else "Onbekend",
-                "listing_history": row.get("listing_history"),
                 "investment_score": row.get("investment_score") if row.get("investment_score") is not None else "Onbekend",
                 "opportunity_score": row.get("opportunity_score") if row.get("opportunity_score") is not None else "Onbekend",
-                "bron": row.get("bron") or "Onbekend",
+                "source_name": row.get("source_name") or "Onbekend",
+                "source_url": row.get("source_url") or "",
             }
         )
 
+    st.markdown("### Woningtabel")
+    if not table_rows:
+        st.info("Geen woningen gevonden met de huidige filters.")
+        return
+
+    table_display_rows = [
+        {
+            key: (_to_display_text(value) if key != "listing_id" else value)
+            for key, value in row.items()
+        }
+        for row in table_rows
+    ]
+
     selection = st.dataframe(
-        table_rows,
+        table_display_rows,
         hide_index=True,
         use_container_width=True,
         on_select="rerun",
@@ -919,28 +1606,38 @@ def _render_propertyhunter_interface_page():
             "energielabel",
             "bouwjaar",
             "days_on_market",
-            "listing_history",
             "investment_score",
             "opportunity_score",
-            "bron",
+            "source_name",
         ],
     )
 
-    selected_indices = []
+    selected_indices: list[int] = []
     if isinstance(selection, dict):
-        selected_indices = (((selection.get("selection") or {}).get("rows")) or []) if isinstance(selection.get("selection"), dict) else []
+        selection_payload = selection.get("selection") if isinstance(selection.get("selection"), dict) else {}
+        selected_indices = selection_payload.get("rows") if isinstance(selection_payload, dict) else []
     else:
-        selected_indices = (((getattr(selection, "selection", {}) or {}).get("rows")) or []) if isinstance(getattr(selection, "selection", {}), dict) else []
+        selection_payload = getattr(selection, "selection", {}) if hasattr(selection, "selection") else {}
+        selected_indices = selection_payload.get("rows") if isinstance(selection_payload, dict) else []
 
     if selected_indices:
         selected_index = int(selected_indices[0])
         if 0 <= selected_index < len(table_rows):
-            selected_listing = str(table_rows[selected_index].get("listing_id") or "").strip()
-            if selected_listing:
-                st.session_state["ph_selected_listing_id"] = selected_listing
-                st.session_state["ph_view"] = "detail"
-                st.query_params["listing_id"] = selected_listing
-                st.rerun()
+            selected_row = table_rows[selected_index]
+            with st.container(border=True):
+                st.markdown("### Geselecteerde woning")
+                st.write(f"{selected_row.get('adres')} · {selected_row.get('plaats')}")
+                st.write(f"Vraagprijs: {selected_row.get('vraagprijs')}")
+                st.write(f"Woonoppervlak: {selected_row.get('woonoppervlak')} m²")
+                st.write(f"Perceel: {selected_row.get('perceel')} m²")
+                st.write(f"Slaapkamers: {selected_row.get('slaapkamers')}")
+                st.write(f"Energielabel: {selected_row.get('energielabel')}")
+                st.write(f"Bouwjaar: {selected_row.get('bouwjaar')}")
+                st.write(f"Days on market: {selected_row.get('days_on_market')}")
+                st.write(f"Investment score: {selected_row.get('investment_score')}")
+                st.write(f"Opportunity score: {selected_row.get('opportunity_score')}")
+                if str(selected_row.get("source_url") or "").strip():
+                    st.link_button("Open bron", str(selected_row.get("source_url")))
 
 
 def _deal_finder_marker(message: str):
@@ -2149,6 +2846,91 @@ def _render_deal_finder_page():
                 )
     _deal_finder_marker("manual_import_section_done")
 
+    st.markdown("### Funda scan")
+    st.caption("Start een stadsgerichte Funda-scan via de bestaande orchestratieflow.")
+
+    if "deal_funda_scan_running" not in st.session_state:
+        st.session_state["deal_funda_scan_running"] = False
+
+    scan_col_1, scan_col_2 = st.columns(2)
+    with scan_col_1:
+        selected_cities = st.multiselect(
+            "Steden",
+            options=["Amsterdam", "Breda", "Den Haag", "Eindhoven", "Groningen", "Haarlem", "Rotterdam", "Utrecht"],
+            default=["Breda", "Amsterdam"],
+            key="deal_funda_scan_cities",
+        )
+        min_price_scan = st.number_input("Minimale vraagprijs", min_value=0, value=0, step=1000, key="deal_funda_scan_min_price")
+        max_price_scan = st.number_input("Maximale vraagprijs", min_value=0, value=0, step=1000, key="deal_funda_scan_max_price")
+    with scan_col_2:
+        min_living_area_scan = st.number_input("Minimaal woonoppervlak (m²)", min_value=0, value=0, step=1, key="deal_funda_scan_min_living_area")
+        max_pages_per_city = st.number_input("Max pagina's per stad", min_value=1, value=1, step=1, key="deal_funda_scan_max_pages")
+        dry_run = st.checkbox("Dry-run", value=True, key="deal_funda_scan_dry_run")
+
+    if min_price_scan > 0 and max_price_scan > 0 and min_price_scan > max_price_scan:
+        st.error("Minimale vraagprijs mag niet hoger zijn dan maximale vraagprijs.")
+    else:
+        run_scan_clicked = st.button(
+            "Start Funda-scan",
+            key="deal_funda_scan_start",
+            type="primary",
+            disabled=bool(st.session_state.get("deal_funda_scan_running")),
+        )
+
+        if run_scan_clicked and st.session_state.get("deal_funda_scan_running"):
+            st.info("Er draait al een scan. Wacht tot deze klaar is.")
+
+        if run_scan_clicked and not st.session_state.get("deal_funda_scan_running"):
+            st.session_state["deal_funda_scan_running"] = True
+            try:
+                with st.spinner("Funda-scan wordt uitgevoerd..."):
+                    scan_result = _run_funda_scan_from_ui(
+                        cities=[str(city) for city in selected_cities],
+                        min_price=int(min_price_scan),
+                        max_price=int(max_price_scan),
+                        min_living_area=int(min_living_area_scan),
+                        max_pages_per_city=int(max_pages_per_city),
+                        dry_run=bool(dry_run),
+                    )
+                st.session_state["deal_funda_scan_result"] = scan_result
+            except Exception as error:
+                st.session_state.pop("deal_funda_scan_result", None)
+                st.error(f"Funda-scan mislukt: {type(error).__name__}: {error}")
+            finally:
+                st.session_state["deal_funda_scan_running"] = False
+
+    latest_scan_result = st.session_state.get("deal_funda_scan_result")
+    if isinstance(latest_scan_result, dict):
+        st.markdown("#### Laatste Funda-scanresultaat")
+        st.write(f"Listings found: {int(latest_scan_result.get('listings_found') or 0)}")
+        st.write(f"Listings imported: {int(latest_scan_result.get('listings_imported') or 0)}")
+        st.write(f"New listings: {int(latest_scan_result.get('new_listings') or 0)}")
+        st.write(f"Changed listings: {int(latest_scan_result.get('changed_listings') or 0)}")
+        st.write(f"Unchanged listings: {int(latest_scan_result.get('unchanged_listings') or 0)}")
+        st.write(f"Price reductions: {int(latest_scan_result.get('price_reductions') or 0)}")
+        st.write(f"Failed listings: {int(latest_scan_result.get('failed_listings') or 0)}")
+        st.write(f"Duration: {_format_seconds(latest_scan_result.get('duration_seconds'))} s")
+        st.write(f"JSON output: {latest_scan_result.get('output_path') or 'Onbekend'}")
+
+        top_rows = latest_scan_result.get("top_rows") if isinstance(latest_scan_result.get("top_rows"), list) else []
+        st.markdown("#### Top 20 op opportunity score")
+        if not top_rows:
+            st.info("Geen resultaten beschikbaar voor de geselecteerde scaninstellingen.")
+        else:
+            presentation_rows = [
+                {
+                    "address": row.get("adres") or "Onbekend",
+                    "city": row.get("plaats") or "Onbekend",
+                    "asking_price": _format_currency(row.get("vraagprijs")),
+                    "living_area": _format_number(row.get("woonoppervlak")),
+                    "price_per_m2": _format_currency(row.get("price_per_m2")) if row.get("price_per_m2") is not None else "Onbekend",
+                    "investment_score": _score_badge(row.get("investment_score")),
+                    "opportunity_score": _score_badge(row.get("opportunity_score")),
+                }
+                for row in top_rows
+            ]
+            _render_opportunity_top_rows(presentation_rows)
+
     st.markdown("### New deal candidates")
     _deal_finder_marker("deal_candidates_section_start")
     source_options = {"Alle bronnen": None}
@@ -2168,13 +2950,22 @@ def _render_deal_finder_page():
     with col_d:
         priority_filter = st.selectbox("Priority", ["alle", "low", "medium", "high", "urgent"], key="deal_priority_filter")
 
-    sort_choice = st.selectbox("Sortering", ["Nieuwste", "Hoogste score", "Laagste vraagprijs", "Hoogste vraagprijs"], key="deal_sort")
-    sort_map = {
-        "Nieuwste": "detected_at_desc",
-        "Hoogste score": "score_desc",
-        "Laagste vraagprijs": "asking_price_asc",
-        "Hoogste vraagprijs": "asking_price_desc",
-    }
+    sort_choice = st.selectbox(
+        "Sortering",
+        [
+            "Nieuwste",
+            "Hoogste deal score",
+            "Hoogste investment score",
+            "Hoogste opportunity score",
+            "Hoogste split potential",
+            "Hoogste vertical extension potential",
+            "Hoogste rental potential",
+            "Hoogste renovation potential",
+            "Laagste vraagprijs",
+            "Hoogste vraagprijs",
+        ],
+        key="deal_sort",
+    )
 
     candidates = DATABASE_SERVICE.list_deal_candidates(
         limit=500,
@@ -2182,7 +2973,7 @@ def _render_deal_finder_page():
         source_id=source_options.get(source_label),
         minimum_score=min_score,
         priority=None if priority_filter == "alle" else priority_filter,
-        sort_by=sort_map.get(sort_choice, "detected_at_desc"),
+        sort_by="detected_at_desc",
     )
 
     if not candidates:
@@ -2190,7 +2981,68 @@ def _render_deal_finder_page():
         _deal_finder_marker("deal_candidates_section_done_empty")
         return
 
-    _render_deal_candidate_cards(candidates)
+    deal_intelligence_rows = _build_deal_intelligence_rows(candidates)
+    sorted_deal_intelligence_rows = _sort_deal_intelligence_rows(deal_intelligence_rows, sort_choice)
+
+    st.markdown("#### Deal Intelligence Pro tabel")
+    _render_rows_with_columns(
+        rows=[
+            {
+                "address": row.get("adres") or "Onbekend",
+                "city": row.get("plaats") or "Onbekend",
+                "price": _format_currency(row.get("vraagprijs")),
+                "living_area": _format_number(row.get("woonoppervlak")),
+                "plot_size": _format_number(row.get("perceel")),
+                "energy_label": row.get("energielabel") or "Onbekend",
+                "construction_year": row.get("bouwjaar") if row.get("bouwjaar") is not None else "Onbekend",
+                "price_per_m2": _format_currency(row.get("price_per_m2")) if row.get("price_per_m2") is not None else "Onbekend",
+                "city_avg_price_per_m2": _format_currency(row.get("city_avg_price_per_m2")) if row.get("city_avg_price_per_m2") is not None else "Onbekend",
+                "difference_vs_city_avg_pct": _format_percentage(_safe_number(row.get("difference_vs_city_avg_pct")), decimals=2),
+                "woz_value": _format_currency(row.get("woz_value")) if row.get("woz_value") is not None else "Niet beschikbaar",
+                "woz_valuation_year": row.get("woz_valuation_year") if row.get("woz_valuation_year") is not None else "Niet beschikbaar",
+                "woz_difference_eur": _format_currency(row.get("asking_price_minus_woz_value")) if row.get("asking_price_minus_woz_value") is not None else "Niet beschikbaar",
+                "woz_difference_pct": _woz_pct_badge(_safe_number(row.get("asking_price_vs_woz_percentage"))),
+                "days_on_market": row.get("days_on_market") if row.get("days_on_market") is not None else "Onbekend",
+                "price_reductions": row.get("price_reduction_count") if row.get("price_reduction_count") is not None else 0,
+                "previous_asking_prices": row.get("vorige_vraagprijzen") or "Onbekend",
+                "split_potential": row.get("split_potential") if row.get("split_potential") is not None else "Onbekend",
+                "vertical_extension_potential": row.get("vertical_extension_potential") if row.get("vertical_extension_potential") is not None else "Onbekend",
+                "rental_potential": row.get("rental_potential") if row.get("rental_potential") is not None else "Onbekend",
+                "renovation_potential": row.get("renovation_potential") if row.get("renovation_potential") is not None else "Onbekend",
+                "investment_score": row.get("investment_score") if row.get("investment_score") is not None else "Onbekend",
+                "opportunity_score": row.get("opportunity_score") if row.get("opportunity_score") is not None else "Onbekend",
+                "recommendation": row.get("investment_recommendation") or "★ Avoid",
+            }
+            for row in sorted_deal_intelligence_rows
+        ],
+        columns=[
+            ("Address", "address"),
+            ("City", "city"),
+            ("Price", "price"),
+            ("Living area", "living_area"),
+            ("Plot size", "plot_size"),
+            ("Energy label", "energy_label"),
+            ("Construction year", "construction_year"),
+            ("Price per m²", "price_per_m2"),
+            ("City avg price per m²", "city_avg_price_per_m2"),
+            ("Difference vs city avg", "difference_vs_city_avg_pct"),
+            ("WOZ value", "woz_value"),
+            ("Valuation year", "woz_valuation_year"),
+            ("Difference €", "woz_difference_eur"),
+            ("Difference %", "woz_difference_pct"),
+            ("Days on market", "days_on_market"),
+            ("Price reductions", "price_reductions"),
+            ("Previous asking prices", "previous_asking_prices"),
+            ("Split potential", "split_potential"),
+            ("Vertical extension potential", "vertical_extension_potential"),
+            ("Rental potential", "rental_potential"),
+            ("Renovation potential", "renovation_potential"),
+            ("Investment score", "investment_score"),
+            ("Opportunity score", "opportunity_score"),
+            ("Investment recommendation", "recommendation"),
+        ],
+        empty_message="Geen Deal Intelligence data beschikbaar.",
+    )
 
     selected_candidate = _resolve_selected_deal_candidate(candidates)
 
@@ -2214,6 +3066,23 @@ def _render_deal_finder_page():
     st.write(f"Oppervlakte: {_format_number(listing_detail.get('surface_m2'))} m²")
     st.write(f"Status: {listing_detail.get('listing_status') or 'Onbekend'}")
     st.write(f"Bron: {source_detail.get('name') or 'Onbekend'}")
+
+    listing_raw_payload = listing_detail.get("raw_payload") if isinstance(listing_detail.get("raw_payload"), dict) else {}
+    detail_woz_value = _safe_number(listing_raw_payload.get("latest_woz_value") or listing_detail.get("latest_woz_value"))
+    detail_woz_year = _safe_score(listing_raw_payload.get("woz_valuation_year") or listing_detail.get("woz_valuation_year"))
+    detail_woz_source = str(listing_raw_payload.get("woz_source") or "Kadaster WOZ-waardeloket")
+    detail_woz_retrieval_date = str(listing_raw_payload.get("woz_retrieval_date") or "Niet beschikbaar")
+    detail_diff_eur, detail_diff_pct = _woz_metrics(_safe_number(listing_detail.get("asking_price")), detail_woz_value)
+
+    st.markdown("#### WOZ details")
+    st.write(f"Asking price: {_format_currency(listing_detail.get('asking_price'))}")
+    st.write(f"WOZ value: {_format_currency(detail_woz_value) if detail_woz_value is not None else 'Niet beschikbaar'}")
+    st.write(f"Valuation year: {detail_woz_year if detail_woz_year is not None else 'Niet beschikbaar'}")
+    st.write(f"Difference in euros: {_format_currency(detail_diff_eur) if detail_diff_eur is not None else 'Niet beschikbaar'}")
+    st.write(f"Difference in percentage: {_format_percentage(detail_diff_pct, decimals=2) if detail_diff_pct is not None else 'Niet beschikbaar'}")
+    st.write(f"WOZ source: {detail_woz_source}")
+    st.write(f"Retrieval date: {detail_woz_retrieval_date}")
+    st.caption("WOZ is een historische belastingwaardering en geen actuele marktwaardering.")
 
     deal_score = _safe_score((selected_candidate or {}).get("score"))
     if deal_score is None:

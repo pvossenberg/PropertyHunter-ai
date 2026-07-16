@@ -1,0 +1,45 @@
+{
+  "source": "funda.nl",
+  "mode": "dry-run",
+  "cities": [
+    "Breda"
+  ],
+  "filters": {
+    "min_price": 0,
+    "max_price": 0,
+    "min_living_area": 0,
+    "max_pages_per_city": 1
+  },
+  "summary": {
+    "listings_found": 0,
+    "new_listings": 0,
+    "changed_listings": 0,
+    "unchanged_listings": 0,
+    "price_reductions": 0,
+    "failed_listings": 0,
+    "duration_seconds": 0.204,
+    "rows_returned": 0
+  },
+  "per_city_results": [
+    {
+      "city": "Breda",
+      "mode": "dry-run",
+      "start_url": "https://www.funda.nl/zoeken/koop/breda/?selected_area=%5B%22breda%22%5D",
+      "result": {
+        "ok": true,
+        "source": "funda",
+        "output_path": "output/scan-runs/funda_scan_20260716_175116.json",
+        "listings_found": 0,
+        "listings_imported": 0,
+        "fully_imported": 0,
+        "partially_imported": 0,
+        "listings_failed": 0,
+        "average_import_time_seconds": 0.0,
+        "warnings": [],
+        "failed_records": []
+      },
+      "rows_found": 0
+    }
+  ],
+  "top_rows": []
+}

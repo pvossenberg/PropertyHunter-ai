@@ -1,0 +1,181 @@
+{
+  "source": "funda.nl",
+  "mode": "dry-run",
+  "cities": [
+    "Breda"
+  ],
+  "filters": {
+    "min_price": 0,
+    "max_price": 0,
+    "min_living_area": 0,
+    "max_pages_per_city": 1
+  },
+  "summary": {
+    "listings_found": 15,
+    "new_listings": 0,
+    "changed_listings": 0,
+    "unchanged_listings": 15,
+    "price_reductions": 0,
+    "failed_listings": 0,
+    "duration_seconds": 7.832,
+    "rows_returned": 15
+  },
+  "per_city_results": [
+    {
+      "city": "Breda",
+      "mode": "dry-run",
+      "start_url": "https://www.funda.nl/zoeken/koop/?selected_area=%5B%22breda%22%5D",
+      "result": {
+        "ok": true,
+        "source": "funda",
+        "output_path": "output/scan-runs/funda_scan_20260716_180925.json",
+        "listings_found": 15,
+        "listings_imported": 15,
+        "fully_imported": 0,
+        "partially_imported": 15,
+        "listings_failed": 0,
+        "average_import_time_seconds": 0.0,
+        "warnings": [],
+        "failed_records": []
+      },
+      "rows_found": 15
+    }
+  ],
+  "top_rows": [
+    {
+      "adres": "Amerongenstraat 2-D6 Breda",
+      "plaats": "Breda",
+      "vraagprijs": 350000.0,
+      "woonoppervlak": null,
+      "investment_score": null,
+      "opportunity_score": null,
+      "source_url": "https://www.funda.nl/detail/koop/breda/appartement-amerongenstraat-2-d6/44435060/"
+    },
+    {
+      "adres": "Antwerpenstraat 308 Breda",
+      "plaats": "Breda",
+      "vraagprijs": 295000.0,
+      "woonoppervlak": null,
+      "investment_score": null,
+      "opportunity_score": null,
+      "source_url": "https://www.funda.nl/detail/koop/breda/appartement-antwerpenstraat-308/44438583/"
+    },
+    {
+      "adres": "de Wetstraat 10 Breda",
+      "plaats": "Breda",
+      "vraagprijs": 398000.0,
+      "woonoppervlak": null,
+      "investment_score": null,
+      "opportunity_score": null,
+      "source_url": "https://www.funda.nl/detail/koop/breda/appartement-de-wetstraat-10/80899020/"
+    },
+    {
+      "adres": "Dr. Struyckenstraat 97-B Breda",
+      "plaats": "Breda",
+      "vraagprijs": 259000.0,
+      "woonoppervlak": null,
+      "investment_score": null,
+      "opportunity_score": null,
+      "source_url": "https://www.funda.nl/detail/koop/breda/appartement-dr-struyckenstraat-97-b/80893309/"
+    },
+    {
+      "adres": "Edisonstraat 30-B Breda",
+      "plaats": "Breda",
+      "vraagprijs": 395000.0,
+      "woonoppervlak": null,
+      "investment_score": null,
+      "opportunity_score": null,
+      "source_url": "https://www.funda.nl/detail/koop/breda/appartement-edisonstraat-30-b/44438070/"
+    },
+    {
+      "adres": "Markendaalseweg 74-D5 Breda",
+      "plaats": "Breda",
+      "vraagprijs": 750000.0,
+      "woonoppervlak": null,
+      "investment_score": null,
+      "opportunity_score": null,
+      "source_url": "https://www.funda.nl/detail/koop/breda/appartement-markendaalseweg-74-d5/44435532/"
+    },
+    {
+      "adres": "Nieuwe Prinsenkade 39 Breda",
+      "plaats": "Breda",
+      "vraagprijs": 475000.0,
+      "woonoppervlak": null,
+      "investment_score": null,
+      "opportunity_score": null,
+      "source_url": "https://www.funda.nl/detail/koop/breda/appartement-nieuwe-prinsenkade-39/44430525/"
+    },
+    {
+      "adres": "van Goorstraat 28 Breda",
+      "plaats": "Breda",
+      "vraagprijs": 225000.0,
+      "woonoppervlak": null,
+      "investment_score": null,
+      "opportunity_score": null,
+      "source_url": "https://www.funda.nl/detail/koop/breda/appartement-van-goorstraat-28/44439399/"
+    },
+    {
+      "adres": "Bieberglaan 9 Breda",
+      "plaats": "Breda",
+      "vraagprijs": 525000.0,
+      "woonoppervlak": 178.0,
+      "investment_score": null,
+      "opportunity_score": null,
+      "source_url": "https://www.funda.nl/detail/koop/breda/huis-bieberglaan-9/44437061/"
+    },
+    {
+      "adres": "Buitenerf 106 Breda",
+      "plaats": "Breda",
+      "vraagprijs": 410000.0,
+      "woonoppervlak": 165.0,
+      "investment_score": null,
+      "opportunity_score": null,
+      "source_url": "https://www.funda.nl/detail/koop/breda/huis-buitenerf-106/44438189/"
+    },
+    {
+      "adres": "Hardenbroekstraat 12 Breda",
+      "plaats": "Breda",
+      "vraagprijs": 500000.0,
+      "woonoppervlak": 177.0,
+      "investment_score": null,
+      "opportunity_score": null,
+      "source_url": "https://www.funda.nl/detail/koop/breda/huis-hardenbroekstraat-12/44437945/"
+    },
+    {
+      "adres": "Hekoord 6 Breda",
+      "plaats": "Breda",
+      "vraagprijs": 450000.0,
+      "woonoppervlak": 205.0,
+      "investment_score": null,
+      "opportunity_score": null,
+      "source_url": "https://www.funda.nl/detail/koop/breda/huis-hekoord-6/44439032/"
+    },
+    {
+      "adres": "Julianalaan 63 Breda",
+      "plaats": "Breda",
+      "vraagprijs": 675000.0,
+      "woonoppervlak": 180.0,
+      "investment_score": null,
+      "opportunity_score": null,
+      "source_url": "https://www.funda.nl/detail/koop/breda/huis-julianalaan-63/44436440/"
+    },
+    {
+      "adres": "Prins Alexanderlaan 23 Breda",
+      "plaats": "Breda",
+      "vraagprijs": 1250000.0,
+      "woonoppervlak": 264.0,
+      "investment_score": null,
+      "opportunity_score": null,
+      "source_url": "https://www.funda.nl/detail/koop/breda/huis-prins-alexanderlaan-23/44436457/"
+    },
+    {
+      "adres": "St. Ignatiusstraat 23-A Breda",
+      "plaats": "Breda",
+      "vraagprijs": 695000.0,
+      "woonoppervlak": 90.0,
+      "investment_score": null,
+      "opportunity_score": null,
+      "source_url": "https://www.funda.nl/detail/koop/breda/huis-st-ignatiusstraat-23-a/44427377/"
+    }
+  ]
+}

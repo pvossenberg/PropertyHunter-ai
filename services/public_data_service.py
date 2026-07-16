@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -135,8 +136,8 @@ class DutchPublicDataService:
 
         def _load() -> dict[str, Any]:
             address_doc = self._resolve_address(property_obj)
-            nummeraanduiding_id = str(address_doc.get("identificatie") or "").strip()
-            if not nummeraanduiding_id:
+            nummeraanduiding_candidates = self._nummeraanduiding_candidates(address_doc)
+            if not nummeraanduiding_candidates:
                 return {
                     "woz_object_number": None,
                     "latest_woz_value": None,
@@ -148,13 +149,42 @@ class DutchPublicDataService:
                     "source": "Kadaster WOZ-waardeloket",
                     "retrieval_date": datetime.now(timezone.utc).isoformat(),
                     "confidence_score": 10,
-                    "raw_payload": {"address": address_doc},
+                    "raw_payload": {"address": address_doc, "tried_nummeraanduiding_ids": []},
                 }
 
-            response = self._request_json(
-                "GET",
-                f"{WOZ_SERVICE_BASE_URL}/wozwaarde/nummeraanduiding/{nummeraanduiding_id}",
-            )
+            response = None
+            selected_nummeraanduiding_id = None
+            errors: list[str] = []
+            for nummeraanduiding_id in nummeraanduiding_candidates:
+                try:
+                    response = self._request_json(
+                        "GET",
+                        f"{WOZ_SERVICE_BASE_URL}/wozwaarde/nummeraanduiding/{nummeraanduiding_id}",
+                    )
+                    selected_nummeraanduiding_id = nummeraanduiding_id
+                    break
+                except Exception as error:
+                    errors.append(f"{nummeraanduiding_id}: {type(error).__name__}: {error}")
+
+            if response is None:
+                return {
+                    "woz_object_number": None,
+                    "latest_woz_value": None,
+                    "woz_valuation_year": None,
+                    "woz_historical_values": [],
+                    "bag_id": None,
+                    "bag_numberaanduiding_id": None,
+                    "bag_pand_id": None,
+                    "source": "Kadaster WOZ-waardeloket",
+                    "retrieval_date": datetime.now(timezone.utc).isoformat(),
+                    "confidence_score": 5,
+                    "raw_payload": {
+                        "address": address_doc,
+                        "tried_nummeraanduiding_ids": nummeraanduiding_candidates,
+                        "errors": errors,
+                    },
+                }
+
             woz_object = response.get("wozObject") or {}
             values = response.get("wozWaarden") or []
             historical_values = []
@@ -175,7 +205,7 @@ class DutchPublicDataService:
                 "woz_valuation_year": self._safe_year(latest.get("peildatum")),
                 "woz_historical_values": historical_values,
                 "bag_id": str(woz_object.get("adresseerbaarobjectid") or "") or None,
-                "bag_numberaanduiding_id": str(woz_object.get("nummeraanduidingid") or "") or None,
+                "bag_numberaanduiding_id": str(woz_object.get("nummeraanduidingid") or selected_nummeraanduiding_id or "") or None,
                 "bag_pand_id": None,
                 "bag_ground_area_m2": _safe_float(woz_object.get("grondoppervlakte")),
                 "address": {
@@ -188,7 +218,13 @@ class DutchPublicDataService:
                 "source": "Kadaster WOZ-waardeloket",
                 "retrieval_date": datetime.now(timezone.utc).isoformat(),
                 "confidence_score": 98 if latest else 65,
-                "raw_payload": response,
+                "raw_payload": {
+                    "response": response,
+                    "address": address_doc,
+                    "selected_nummeraanduiding_id": selected_nummeraanduiding_id,
+                    "tried_nummeraanduiding_ids": nummeraanduiding_candidates,
+                    "errors": errors,
+                },
             }
         return self._cached(cache_key, _load)
 
@@ -242,10 +278,97 @@ class DutchPublicDataService:
             query = " ".join(part for part in query_parts if isinstance(part, str) and part.strip())
             response = self._request_json("GET", PDOK_LOCATIESERVER_FREE_URL, params={"q": query})
             docs = (response.get("response") or {}).get("docs") or []
-            address_doc = next((doc for doc in docs if doc.get("type") == "adres"), docs[0] if docs else {})
+            address_doc = self._select_best_address_doc(property_obj, docs)
             return dict(address_doc) if isinstance(address_doc, dict) else {}
 
         return self._cached(cache_key, _load)
+
+    def _select_best_address_doc(self, property_obj: Property, docs: list[dict[str, Any]]) -> dict[str, Any]:
+        if not docs:
+            return {}
+        expected = self._parse_address_components(property_obj)
+
+        def score(doc: dict[str, Any]) -> tuple[int, float]:
+            points = 0
+            if str(doc.get("type") or "").strip().lower() == "adres":
+                points += 40
+
+            if expected["postcode"]:
+                doc_postcode = str(doc.get("postcode") or "").replace(" ", "").upper()
+                if doc_postcode == expected["postcode"]:
+                    points += 30
+
+            if expected["house_number"] is not None:
+                if _safe_int(doc.get("huisnummer")) == expected["house_number"]:
+                    points += 15
+
+            if expected["house_letter"]:
+                if str(doc.get("huisletter") or "").strip().upper() == expected["house_letter"]:
+                    points += 8
+
+            if expected["house_number_addition"]:
+                if str(doc.get("huisnummertoevoeging") or "").strip().upper() == expected["house_number_addition"]:
+                    points += 8
+
+            if str(property_obj.city or "").strip() and str(doc.get("woonplaatsnaam") or "").strip().lower() == str(property_obj.city or "").strip().lower():
+                points += 8
+
+            relevance = _safe_float(doc.get("score")) or 0.0
+            return points, relevance
+
+        best = max((doc for doc in docs if isinstance(doc, dict)), key=score, default={})
+        return best if isinstance(best, dict) else {}
+
+    def _parse_address_components(self, property_obj: Property) -> dict[str, Any]:
+        address = str(property_obj.address or "")
+        postal_code_text = str(property_obj.postal_code or "")
+
+        postcode_candidate = postal_code_text or address
+        normalized_postcode = None
+        postcode_match = re.search(r"(\d{4})\s*([A-Za-z]{2})", postcode_candidate)
+        if postcode_match:
+            normalized_postcode = f"{postcode_match.group(1)}{postcode_match.group(2).upper()}"
+
+        house_number = None
+        house_letter = ""
+        house_number_addition = ""
+        house_match = re.search(r"\b(\d{1,5})(?:\s*[-/]?\s*([A-Za-z]))?(?:\s*[-/]?\s*([A-Za-z0-9]{1,4}))?\b", address)
+        if house_match:
+            house_number = _safe_int(house_match.group(1))
+            house_letter = str(house_match.group(2) or "").strip().upper()
+            house_number_addition = str(house_match.group(3) or "").strip().upper()
+            if house_number_addition and house_number_addition == house_letter:
+                house_number_addition = ""
+
+        return {
+            "postcode": normalized_postcode,
+            "house_number": house_number,
+            "house_letter": house_letter,
+            "house_number_addition": house_number_addition,
+        }
+
+    def _nummeraanduiding_candidates(self, address_doc: dict[str, Any]) -> list[str]:
+        if not isinstance(address_doc, dict):
+            return []
+
+        candidates: list[str] = []
+        for key in ("nummeraanduiding_id", "nummeraanduidingid"):
+            value = str(address_doc.get(key) or "").strip()
+            if value and value not in candidates:
+                candidates.append(value)
+
+        identificatie = str(address_doc.get("identificatie") or "").strip()
+        if identificatie:
+            split_parts = [part.strip() for part in identificatie.split("-") if part.strip()]
+            for part in split_parts:
+                if part not in candidates:
+                    candidates.append(part)
+
+        # Nummeraanduiding identifiers in BAG are numeric; prefer those likely to be nummeraanduiding over VBO ids.
+        numeric_candidates = [item for item in candidates if item.isdigit()]
+        preferred = [item for item in numeric_candidates if item.startswith("0")]
+        ordered = preferred + [item for item in numeric_candidates if item not in preferred]
+        return ordered or candidates
 
     def _request_json(self, method: str, url: str, *, params: dict[str, Any] | None = None, data: Any = None, headers: dict[str, str] | None = None) -> dict[str, Any]:
         response = self._requester(

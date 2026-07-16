@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from statistics import median
 from typing import Any
 
 from deal_finder.deduplication import match_listing
@@ -10,8 +11,10 @@ from deal_finder.ranking import rank_listing
 from deal_finder.sources.base import SourceRecordResult
 from deal_finder.sources.manual_import import ManualImportAdapter
 from deal_finder.sources.registry import SourceAdapterRegistry, build_default_source_registry
+from models.property import Property
 from services.database import DatabaseService
 from services.listing_history import ListingHistoryEngine
+from services.property_enrichment import PropertyEnrichmentEngine
 
 LOGGER = logging.getLogger(__name__)
 
@@ -61,6 +64,42 @@ def _choose_text_value(field_name: str, existing: Any, extracted: Any, source_na
     return existing
 
 
+def _safe_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _clamp_score(value: float | int) -> int:
+    return max(0, min(100, int(round(float(value)))))
+
+
+def _priority_from_score(score: int) -> str:
+    if score >= 90:
+        return "urgent"
+    if score >= 75:
+        return "high"
+    if score >= 55:
+        return "medium"
+    return "low"
+
+
 def _updated_metadata_fields(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
     changed: list[str] = []
     for key in ("title", "address", "postal_code", "city", "asking_price", "surface_m2", "property_type"):
@@ -81,6 +120,7 @@ class DealFinderOrchestrator:
         self.metadata_extractor = metadata_extractor
         self.source_registry = source_registry or build_default_source_registry()
         self.listing_history_engine = ListingHistoryEngine()
+        self.property_enrichment_engine = PropertyEnrichmentEngine()
 
     def seed_default_sources(self) -> list[dict[str, Any]]:
         seeded: list[dict[str, Any]] = []
@@ -339,16 +379,28 @@ class DealFinderOrchestrator:
                 )
                 self.database_service.update_listing_history(str(listing_id), history_result.to_dict())
 
-                ranking = self._rank_listing_from_row(listing_row=listing_row, source_name=source_name)
+                ranking = self._rank_listing_from_row(listing_row=listing_row, source_name=source_name, all_rows=existing_rows)
                 self.database_service.create_or_update_deal_candidate(
                     listing_id=str(listing_id),
                     property_id=dedupe.matched_property_id,
-                    investment_score=None,
+                    investment_score=ranking.component_scores.get("investment_score"),
                     hidden_value_score=ranking.candidate_score,
                     priority=ranking.priority,
                     reasons=ranking.reason_codes,
                     review_status="new",
                 )
+
+                if "funda" in _safe_text(source_name).lower():
+                    try:
+                        listing_row, enrichment_warnings = self._enrich_listing_with_public_data(
+                            listing_row=listing_row,
+                            source_name=source_name,
+                        )
+                        warnings.extend(enrichment_warnings)
+                    except Exception as error:
+                        warnings.append(
+                            f"{listing.source_url}: WOZ enrichment failed: {type(error).__name__}: {error}"
+                        )
 
                 imported += 1
                 listing_ids.append(str(listing_id))
@@ -387,6 +439,104 @@ class DealFinderOrchestrator:
             "record_results": record_results,
         }
 
+    def _enrich_listing_with_public_data(self, *, listing_row: dict[str, Any], source_name: str) -> tuple[dict[str, Any], list[str]]:
+        warnings: list[str] = []
+        source_url = str(listing_row.get("source_url") or "").strip()
+        if not source_url:
+            return listing_row, ["WOZ enrichment skipped: missing source_url."]
+
+        raw_payload = listing_row.get("raw_payload") if isinstance(listing_row.get("raw_payload"), dict) else {}
+        property_payload = {
+            "source_url": source_url,
+            "title": listing_row.get("title") or raw_payload.get("title"),
+            "address": listing_row.get("address") or raw_payload.get("address"),
+            "city": listing_row.get("city") or raw_payload.get("city"),
+            "asking_price": listing_row.get("asking_price") or raw_payload.get("asking_price"),
+            "surface_m2": listing_row.get("surface_m2") or raw_payload.get("surface_m2") or raw_payload.get("living_area"),
+            "property_type": listing_row.get("property_type") or raw_payload.get("property_type"),
+            "listing_status": listing_row.get("listing_status") or raw_payload.get("listing_status") or "active",
+            "postal_code": raw_payload.get("postal_code"),
+            "municipality": raw_payload.get("municipality"),
+            "raw_extracted_data": raw_payload,
+        }
+        property_row = self.database_service.upsert_property(property_payload)
+        property_id = str(property_row.get("id") or "").strip()
+        if not property_id:
+            warnings.append(f"{source_url}: WOZ enrichment unavailable, property row could not be persisted.")
+            return listing_row, warnings
+
+        enrichment_result = self.property_enrichment_engine.enrich(
+            Property(
+                source_url=source_url,
+                listing_id=property_id,
+                title=property_payload.get("title"),
+                address=property_payload.get("address"),
+                city=property_payload.get("city"),
+                postal_code=property_payload.get("postal_code"),
+                municipality=property_payload.get("municipality"),
+                asking_price=_safe_float(property_payload.get("asking_price")),
+                surface_m2=_safe_float(property_payload.get("surface_m2")),
+                property_type=property_payload.get("property_type"),
+                listing_status=property_payload.get("listing_status") or "active",
+                raw_text=str(raw_payload.get("raw_text") or ""),
+                description=str(raw_payload.get("description") or listing_row.get("description") or ""),
+            )
+        )
+
+        self.database_service.upsert_property_enrichment_group(
+            property_id=property_id,
+            status="completed",
+            started_at=enrichment_result.started_at,
+            completed_at=enrichment_result.completed_at,
+            source=source_name,
+            warning_count=sum(1 for item in enrichment_result.items if not item.success),
+            error_count=sum(1 for item in enrichment_result.items if not item.success),
+            summary={"enrichment_count": len(enrichment_result.items)},
+        )
+
+        self.database_service.batch_upsert_property_enrichments(
+            property_id=property_id,
+            enrichments=[item.to_dict() for item in enrichment_result.items],
+        )
+
+        items_by_key = {item.enrichment_key: item for item in enrichment_result.items}
+        woz_item = items_by_key.get("latest_woz_value")
+        valuation_year_item = items_by_key.get("woz_valuation_year")
+        bag_id_item = items_by_key.get("bag_id")
+
+        woz_value = _safe_float(woz_item.value) if woz_item else None
+        if woz_value is None:
+            warnings.append(f"{source_url}: WOZ data unavailable for this listing.")
+
+        updated_raw_payload = {
+            **raw_payload,
+            "bag_id": bag_id_item.value if bag_id_item else raw_payload.get("bag_id"),
+            "latest_woz_value": woz_value,
+            "woz_valuation_year": _safe_int(valuation_year_item.value) if valuation_year_item else raw_payload.get("woz_valuation_year"),
+            "woz_retrieval_date": woz_item.retrieval_date if woz_item else None,
+            "woz_source": woz_item.source if woz_item else "Kadaster WOZ-waardeloket",
+            "woz_confidence_score": woz_item.confidence_score if woz_item else 0,
+            "woz_historical_values": (items_by_key.get("woz_historical_values").value if items_by_key.get("woz_historical_values") else []),
+        }
+
+        updated_listing = self.database_service.upsert_listing(
+            listing_id=str(listing_row.get("id") or "") or None,
+            source_id=listing_row.get("source_id"),
+            external_listing_id=listing_row.get("external_listing_id"),
+            source_url=source_url,
+            title=listing_row.get("title"),
+            address=listing_row.get("address"),
+            city=listing_row.get("city"),
+            asking_price=listing_row.get("asking_price"),
+            surface_m2=listing_row.get("surface_m2"),
+            property_type=listing_row.get("property_type"),
+            listing_status=listing_row.get("listing_status") or "active",
+            raw_payload=updated_raw_payload,
+            dedupe_match=type("Dedupe", (), {"matched_property_id": property_id})(),
+        )
+
+        return (updated_listing or listing_row), warnings
+
     def refresh_listing_metadata(self, listing_id: str) -> dict[str, Any]:
         detail = self.database_service.get_listing_detail(listing_id)
         listing = detail.get("listing") or {}
@@ -421,12 +571,16 @@ class DealFinderOrchestrator:
             },
         )
 
-        ranking = self._rank_listing_from_row(listing_row, source_name=(detail.get("source") or {}).get("name") or "manual")
+        ranking = self._rank_listing_from_row(
+            listing_row,
+            source_name=(detail.get("source") or {}).get("name") or "manual",
+            all_rows=self.database_service.list_raw_listings(limit=5000),
+        )
         existing_candidate = detail.get("candidate") or {}
         self.database_service.create_or_update_deal_candidate(
             listing_id=str(listing_row.get("id")),
             property_id=listing_row.get("property_id"),
-            investment_score=None,
+            investment_score=ranking.component_scores.get("investment_score"),
             hidden_value_score=ranking.candidate_score,
             priority=ranking.priority,
             reasons=ranking.reason_codes,
@@ -572,11 +726,11 @@ class DealFinderOrchestrator:
                 elif snapshot_result.get("changed"):
                     changed += 1
 
-                ranking = self._rank_listing_from_row(listing_row=listing_row, source_name=source_name)
+                ranking = self._rank_listing_from_row(listing_row=listing_row, source_name=source_name, all_rows=existing_rows)
                 self.database_service.create_or_update_deal_candidate(
                     listing_id=str(listing_id),
                     property_id=dedupe.matched_property_id,
-                    investment_score=None,
+                    investment_score=ranking.component_scores.get("investment_score"),
                     hidden_value_score=ranking.candidate_score,
                     priority=ranking.priority,
                     reasons=ranking.reason_codes,
@@ -628,30 +782,165 @@ class DealFinderOrchestrator:
             "record_results": record_results,
         }
 
-    def _rank_listing_from_row(self, listing_row: dict[str, Any], source_name: str):
+    def _rank_listing_from_row(self, listing_row: dict[str, Any], source_name: str, all_rows: list[dict[str, Any]] | None = None):
+        enriched = self._listing_data_with_fallbacks(listing_row)
+        city_benchmarks = self._city_benchmarks(enriched.get("city"), all_rows)
+        investment_score = self._investment_score(enriched, city_benchmarks)
+        opportunity_score = self._opportunity_score(enriched, city_benchmarks, investment_score)
+
         listing = NormalizedListing(
             source_name=source_name,
             source_url=str(listing_row.get("source_url") or ""),
             external_listing_id=listing_row.get("external_listing_id"),
-            title=listing_row.get("title"),
-            address=listing_row.get("address"),
-            city=listing_row.get("city"),
-            asking_price=listing_row.get("asking_price"),
-            surface_m2=listing_row.get("surface_m2"),
-            property_type=listing_row.get("property_type"),
+            title=enriched.get("title"),
+            address=enriched.get("address"),
+            city=enriched.get("city"),
+            asking_price=enriched.get("asking_price"),
+            surface_m2=enriched.get("surface_m2"),
+            property_type=enriched.get("property_type"),
             description=listing_row.get("description"),
             listing_status=listing_row.get("listing_status") or "active",
             raw_payload=listing_row.get("raw_payload") or {},
         )
-        return rank_listing(
+        ranking_result = rank_listing(
             listing,
             context={
-                "price_per_m2": (listing.asking_price / listing.surface_m2) if listing.asking_price and listing.surface_m2 else None,
-                "days_on_market": None,
-                "price_reduction_count": None,
-                "investment_score": None,
+                "price_per_m2": enriched.get("price_per_m2"),
+                "days_on_market": _safe_int(enriched.get("days_on_market")),
+                "price_reduction_count": _safe_int(enriched.get("price_reduction_count")),
+                "investment_score": investment_score,
             },
         )
+
+        return type(ranking_result)(
+            candidate_score=opportunity_score,
+            priority=_priority_from_score(opportunity_score),
+            reason_codes=ranking_result.reason_codes,
+            missing_data_warnings=ranking_result.missing_data_warnings,
+            component_scores={
+                **(ranking_result.component_scores or {}),
+                "investment_score": investment_score,
+                "opportunity_score": opportunity_score,
+            },
+        )
+
+    def _listing_data_with_fallbacks(self, listing_row: dict[str, Any]) -> dict[str, Any]:
+        raw_payload = listing_row.get("raw_payload") if isinstance(listing_row.get("raw_payload"), dict) else {}
+
+        def pick(*keys: str):
+            for key in keys:
+                if key in listing_row and listing_row.get(key) not in (None, ""):
+                    return listing_row.get(key)
+                if key in raw_payload and raw_payload.get(key) not in (None, ""):
+                    return raw_payload.get(key)
+            return None
+
+        asking_price = _safe_float(pick("asking_price", "current_asking_price"))
+        surface_m2 = _safe_float(pick("surface_m2", "living_area"))
+        price_per_m2 = _safe_float(pick("price_per_m2"))
+        if price_per_m2 is None and asking_price not in (None, 0) and surface_m2 not in (None, 0):
+            price_per_m2 = round(float(asking_price) / float(surface_m2), 2)
+
+        return {
+            "title": pick("title"),
+            "address": pick("address"),
+            "city": pick("city"),
+            "property_type": pick("property_type"),
+            "asking_price": asking_price,
+            "surface_m2": surface_m2,
+            "energy_label": _safe_text(pick("energy_label")).upper(),
+            "construction_year": _safe_int(pick("construction_year", "bag_building_year")),
+            "plot_size_m2": _safe_float(pick("plot_size_m2", "plot_size")),
+            "bedrooms": _safe_int(pick("bedrooms")),
+            "days_on_market": _safe_int(pick("days_on_market")),
+            "price_reduction_count": _safe_int(pick("price_reduction_count")),
+            "price_per_m2": price_per_m2,
+        }
+
+    def _city_benchmarks(self, city: Any, all_rows: list[dict[str, Any]] | None = None) -> dict[str, float | None]:
+        city_name = _safe_text(city)
+        rows = list(all_rows or self.database_service.list_raw_listings(limit=5000))
+
+        city_prices: list[float] = []
+        city_ppm2: list[float] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            enriched = self._listing_data_with_fallbacks(row)
+            if city_name and _safe_text(enriched.get("city")).lower() != city_name.lower():
+                continue
+            asking_price = _safe_float(enriched.get("asking_price"))
+            if asking_price is not None:
+                city_prices.append(asking_price)
+            price_per_m2 = _safe_float(enriched.get("price_per_m2"))
+            if price_per_m2 is not None:
+                city_ppm2.append(price_per_m2)
+
+        return {
+            "avg_price_per_m2": round(sum(city_ppm2) / len(city_ppm2), 2) if city_ppm2 else None,
+            "median_asking_price": round(float(median(city_prices)), 2) if city_prices else None,
+        }
+
+    def _investment_score(self, data: dict[str, Any], benchmarks: dict[str, float | None]) -> int:
+        score = 0
+
+        price_per_m2 = _safe_float(data.get("price_per_m2"))
+        avg_city_ppm2 = _safe_float(benchmarks.get("avg_price_per_m2"))
+        if price_per_m2 is not None and avg_city_ppm2 is not None and price_per_m2 < avg_city_ppm2:
+            score += 25
+
+        living_area = _safe_float(data.get("surface_m2"))
+        if living_area is not None and living_area > 100:
+            score += 20
+
+        if _safe_text(data.get("energy_label")).upper() in {"A", "A+", "A++", "A+++", "A++++", "B"}:
+            score += 15
+
+        construction_year = _safe_int(data.get("construction_year"))
+        if construction_year is not None and construction_year > 1995:
+            score += 15
+
+        asking_price = _safe_float(data.get("asking_price"))
+        median_asking_price = _safe_float(benchmarks.get("median_asking_price"))
+        if asking_price is not None and median_asking_price is not None and asking_price < median_asking_price:
+            score += 15
+
+        plot_size = _safe_float(data.get("plot_size_m2"))
+        if plot_size is not None and plot_size > 150:
+            score += 10
+
+        return _clamp_score(score)
+
+    def _opportunity_score(self, data: dict[str, Any], benchmarks: dict[str, float | None], investment_score: int) -> int:
+        price_per_m2 = _safe_float(data.get("price_per_m2"))
+        avg_city_ppm2 = _safe_float(benchmarks.get("avg_price_per_m2"))
+
+        percentile_component = 0.0
+        if price_per_m2 is not None and avg_city_ppm2 is not None and avg_city_ppm2 > 0:
+            ratio = (avg_city_ppm2 - price_per_m2) / avg_city_ppm2
+            percentile_component = max(0.0, min(20.0, ratio * 100.0 * 0.4))
+
+        tracked_fields = [
+            data.get("surface_m2"),
+            data.get("energy_label"),
+            data.get("construction_year"),
+            data.get("plot_size_m2"),
+            data.get("bedrooms"),
+            data.get("price_per_m2"),
+        ]
+        filled_fields = sum(1 for value in tracked_fields if value not in (None, "", 0))
+        completeness_component = (filled_fields / len(tracked_fields)) * 20.0
+
+        upside_component = 0.0
+        if int(_safe_int(data.get("price_reduction_count")) or 0) > 0:
+            upside_component += 8.0
+        if _safe_int(data.get("construction_year")) is not None and int(_safe_int(data.get("construction_year")) or 0) < 1990:
+            upside_component += 4.0
+        if _safe_text(data.get("energy_label")).upper() in {"D", "E", "F", "G"}:
+            upside_component += 3.0
+
+        score = (float(investment_score) * 0.55) + percentile_component + completeness_component + upside_component
+        return _clamp_score(score)
 
     def _enrich_listing_row(
         self,
