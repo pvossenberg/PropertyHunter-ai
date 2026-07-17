@@ -136,6 +136,76 @@ class PropertyHunterTests(unittest.TestCase):
         self.assertIn("eindhoven", selected_slugs)
         self.assertIn("groningen", selected_slugs)
 
+    def test_funda_scan_processes_mixed_address_with_ab_suffix(self):
+        import app as app_module
+
+        selected_cities = ["Rotterdam"]
+
+        class FakeDatabaseServiceCtor:
+            def __init__(self):
+                self.is_enabled = False
+
+        def fake_run_source_scan(source_name, **kwargs):
+            self.assertEqual(source_name, "funda")
+            output_path = str(kwargs.get("output_dir") / "mock_mathenesserlaan.json")
+            payload = {
+                "properties": [
+                    {
+                        "property": {
+                            "listing_id": "math-369ab",
+                            "address": "Mathenesserlaan 369 A/B",
+                            "city": "Rotterdam",
+                            "asking_price": 1250000,
+                            "asking_price_status": "known",
+                            "asking_price_text": "€ 1.250.000 k.k.",
+                            "surface_m2": 412,
+                            "listed_since": "2026-07-16",
+                            "source_timestamp": "2026-07-16T08:00:00+00:00",
+                            "source_url": "https://www.funda.nl/detail/koop/rotterdam/mathenesserlaan-369-a-b/12345678/",
+                            "raw_payload": {
+                                "address": "Mathenesserlaan 369 A/B",
+                                "city": "Rotterdam",
+                            },
+                        }
+                    }
+                ]
+            }
+            Path(output_path).write_text(json.dumps(payload), encoding="utf-8")
+            return {
+                "ok": True,
+                "listings_found": 1,
+                "listings_imported": 1,
+                "listings_failed": 0,
+                "output_path": output_path,
+            }
+
+        original_run_source_scan = app_module._run_source_scan
+        original_probe_http_status = app_module._probe_http_status
+        original_database_service_cls = app_module.DatabaseService
+        try:
+            app_module._run_source_scan = fake_run_source_scan
+            app_module._probe_http_status = lambda url, timeout_seconds=12.0: (200, None)
+            app_module.DatabaseService = FakeDatabaseServiceCtor
+
+            result = _run_funda_scan_from_ui(
+                cities=selected_cities,
+                min_price=0,
+                max_price=0,
+                min_living_area=0,
+                max_pages_per_city=2,
+                dry_run=True,
+            )
+        finally:
+            app_module._run_source_scan = original_run_source_scan
+            app_module._probe_http_status = original_probe_http_status
+            app_module.DatabaseService = original_database_service_cls
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result.get("top_rows") or []), 1)
+        row = (result.get("top_rows") or [])[0]
+        self.assertEqual(row.get("adres"), "Mathenesserlaan 369 A/B")
+        self.assertEqual(row.get("plaats"), "Rotterdam")
+
     def test_run_source_scan_writes_json_and_counts_results(self):
         class FakeDatabaseService:
             def __init__(self):

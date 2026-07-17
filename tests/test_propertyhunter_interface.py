@@ -6,7 +6,9 @@ from app import (
     _build_propertyhunter_rows,
     _filter_propertyhunter_rows,
     _latest_scan_metrics,
+    _normalize_address_input,
     _propertyhunter_listing_history_text,
+    _scan_data_origin_label,
     _score_rows_with_opportunity_intelligence,
     _sort_deal_intelligence_rows,
     _woz_metrics,
@@ -15,6 +17,14 @@ from app import (
 
 
 class PropertyHunterInterfaceHelpersTests(unittest.TestCase):
+    def test_normalize_address_input_supports_exact_lookup(self):
+        self.assertEqual(_normalize_address_input(" Mathenesserlaan 369 A/B "), "mathenesserlaan 369 a/b")
+
+    def test_scan_data_origin_label_values(self):
+        self.assertIn("live scraper", _scan_data_origin_label(latest_scan_result={"mode": "live"}, database_enabled=True))
+        self.assertIn("dry-run", _scan_data_origin_label(latest_scan_result={"mode": "dry-run"}, database_enabled=True))
+        self.assertIn("Supabase", _scan_data_origin_label(latest_scan_result=None, database_enabled=True))
+
     def test_woz_metrics_handles_missing_and_calculates_difference(self):
         self.assertEqual(_woz_metrics(None, 400000), (None, None))
         self.assertEqual(_woz_metrics(500000, None), (None, None))

@@ -201,6 +201,7 @@ def _run_source_scan(
     start_url: str | None = None,
     max_pages: int = 1000,
     timeout_seconds: float = 12.0,
+    force_refresh: bool = False,
 ) -> dict[str, Any]:
     active_orchestrator = orchestrator or DEAL_FINDER_ORCHESTRATOR
     active_database = database_service or DATABASE_SERVICE
@@ -217,6 +218,7 @@ def _run_source_scan(
         "start_url": str(start_url or getattr(adapter, "default_start_url", "") or "").strip(),
         "max_pages": max_pages,
         "timeout_seconds": timeout_seconds,
+        "force_refresh": bool(force_refresh),
     }
     is_valid, warnings = adapter.validate_configuration(configuration)
     if not is_valid:
@@ -227,7 +229,7 @@ def _run_source_scan(
 
     scan_started_at = time.perf_counter()
     print(f"Start scan voor source: {source_name}")
-    print(f"Config: max_pages={max_pages}, timeout_seconds={timeout_seconds}")
+    print(f"Config: max_pages={max_pages}, timeout_seconds={timeout_seconds}, force_refresh={bool(force_refresh)}")
 
     try:
         results = adapter.load_and_normalize_listings(configuration)
@@ -396,6 +398,7 @@ def _run_source_scan(
     scan_payload = {
         "source": source_name,
         "configuration": configuration,
+        "data_origin": "live_scraper",
         "summary": {
             "listings_found": listings_found,
             "listings_imported": imported_count,
@@ -995,6 +998,8 @@ def _build_propertyhunter_rows(candidates: list[dict[str, Any]]) -> list[dict[st
                 "adres": _listing_value(listing, "address") or "Onbekend",
                 "plaats": _listing_value(listing, "city") or "Onbekend",
                 "vraagprijs": _safe_number(_listing_value(listing, "asking_price")),
+                "asking_price_status": str(_listing_value(listing, "asking_price_status") or "unknown"),
+                "asking_price_text": str(_listing_value(listing, "asking_price_text") or ""),
                 "woonoppervlak": _safe_number(_listing_value(listing, "surface_m2", "living_area")),
                 "funda_woonoppervlak": _safe_number(_listing_value(listing, "funda_living_area_m2", "surface_m2", "living_area")),
                 "bag_oppervlak": _safe_number(_listing_value(listing, "bag_official_floor_area_m2")),
@@ -1016,6 +1021,8 @@ def _build_propertyhunter_rows(candidates: list[dict[str, Any]]) -> list[dict[st
                 "price_reduction_count": _safe_score(_listing_value(listing, "price_reduction_count")),
                 "days_on_market": _safe_score(_listing_value(listing, "days_on_market")),
                 "listing_history": _propertyhunter_listing_history_text(listing),
+                "listed_since": str(_listing_value(listing, "listed_since") or ""),
+                "source_timestamp": str(_listing_value(listing, "source_timestamp", "timestamp") or ""),
                 "investment_score": _safe_score(candidate.get("investment_score")),
                 "opportunity_score": _safe_score(candidate.get("hidden_value_score") if candidate.get("hidden_value_score") is not None else candidate.get("score")),
                 "bron": str(source.get("name") or _listing_value(listing, "source_url") or "Onbekend"),
@@ -1102,6 +1109,10 @@ def _normalize_city_input(city: str) -> str:
     return " ".join(str(city or "").split()).strip()
 
 
+def _normalize_address_input(address: str) -> str:
+    return " ".join(str(address or "").strip().casefold().split())
+
+
 @st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
 def _load_funda_place_options() -> list[str]:
     merged: list[str] = []
@@ -1156,6 +1167,18 @@ def _merge_scan_cities(selected_cities: list[str], custom_city: str) -> list[str
     return merged
 
 
+def _scan_data_origin_label(*, latest_scan_result: dict[str, Any] | None, database_enabled: bool) -> str:
+    if isinstance(latest_scan_result, dict):
+        mode = str(latest_scan_result.get("mode") or "").strip().lower()
+        if mode == "live":
+            return "Dataherkomst: live scraperresultaten van de laatste handmatige scan."
+        if mode == "dry-run":
+            return "Dataherkomst: live scraperresultaten (dry-run, niet blijvend opgeslagen)."
+    if database_enabled:
+        return "Dataherkomst: opgeslagen listings/dealcandidates uit Supabase."
+    return "Dataherkomst: geen live databron beschikbaar (mock/offline toestand)."
+
+
 def _build_rows_from_scan_properties(properties: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for item in properties:
@@ -1180,9 +1203,12 @@ def _build_rows_from_scan_properties(properties: list[dict[str, Any]]) -> list[d
 
         rows.append(
             {
+                "listing_id": str(value("listing_id") or "").strip(),
                 "adres": value("address") or "Onbekend",
                 "plaats": value("city") or "Onbekend",
                 "vraagprijs": _safe_number(value("asking_price")),
+                "asking_price_status": str(value("asking_price_status") or "unknown"),
+                "asking_price_text": str(value("asking_price_text") or ""),
                 "woonoppervlak": _safe_number(value("surface_m2", "living_area", "bag_official_floor_area_m2")),
                 "funda_woonoppervlak": _safe_number(value("funda_living_area_m2", "surface_m2", "living_area")),
                 "bag_oppervlak": _safe_number(value("bag_official_floor_area_m2")),
@@ -1195,6 +1221,8 @@ def _build_rows_from_scan_properties(properties: list[dict[str, Any]]) -> list[d
                 "energielabel": str(value("energy_label") or "Onbekend"),
                 "bouwjaar": _safe_score(value("construction_year", "bag_building_year")),
                 "price_reduction_count": _safe_score(value("price_reduction_count")),
+                "listed_since": str(value("listed_since") or ""),
+                "source_timestamp": str(value("source_timestamp", "timestamp") or ""),
                 "price_per_m2": _safe_number(value("asking_price_per_m2", "price_per_m2")),
                 "asking_price_per_m2": _safe_number(value("asking_price_per_m2", "price_per_m2")),
                 "woz_per_m2": _safe_number(value("woz_value_per_m2")),
@@ -1541,6 +1569,7 @@ def _run_funda_scan_from_ui(
                     start_url=start_url,
                     max_pages=max(1, int(max_pages_per_city or 1)),
                     timeout_seconds=12.0,
+                    force_refresh=True,
                 )
                 if not city_result.get("ok"):
                     raise RuntimeError(city_result.get("error") or "onbekende fout")
@@ -1597,6 +1626,7 @@ def _run_funda_scan_from_ui(
                     "start_url": start_url,
                     "max_pages": max(1, int(max_pages_per_city or 1)),
                     "timeout_seconds": 12.0,
+                    "force_refresh": True,
                 },
             )
             if not import_result.get("ok"):
@@ -1790,7 +1820,8 @@ def _render_propertyhunter_interface_page():
         st.info("Geen scanresultaten beschikbaar.")
         return
 
-    places = sorted({str(row.get("city") or "").strip() for row in rows if str(row.get("city") or "").strip()})
+    municipality_options = _load_funda_place_options()
+    places = [city for city in municipality_options if any(str(row.get("city") or "").strip() == city for row in rows)]
     asking_prices = [_safe_number(row.get("asking_price")) for row in rows if _safe_number(row.get("asking_price")) is not None]
     living_areas = [_safe_number(row.get("living_area")) for row in rows if _safe_number(row.get("living_area")) is not None]
 
@@ -3216,6 +3247,7 @@ def _render_deal_finder_page():
                 st.session_state["deal_funda_scan_running"] = False
 
     latest_scan_result = st.session_state.get("deal_funda_scan_result")
+    st.info(_scan_data_origin_label(latest_scan_result=latest_scan_result if isinstance(latest_scan_result, dict) else None, database_enabled=DATABASE_SERVICE.is_enabled))
     if isinstance(latest_scan_result, dict):
         st.markdown("#### Laatste Funda-scanresultaat")
         st.write(f"Listings found: {int(latest_scan_result.get('listings_found') or 0)}")
@@ -3320,6 +3352,12 @@ def _render_deal_finder_page():
         ],
         key="deal_sort",
     )
+    exact_address_query = st.text_input(
+        "Zoek exact adres",
+        value="",
+        key="deal_exact_address_query",
+        help="Exacte match op adres (hoofdletterongevoelig), bijv. Mathenesserlaan 369 A/B.",
+    )
 
     candidates = DATABASE_SERVICE.list_deal_candidates(
         limit=500,
@@ -3336,7 +3374,16 @@ def _render_deal_finder_page():
         return
 
     deal_intelligence_rows = _build_deal_intelligence_rows(candidates)
+    if isinstance(exact_address_query, str) and exact_address_query.strip():
+        normalized_query = _normalize_address_input(exact_address_query)
+        deal_intelligence_rows = [
+            row for row in deal_intelligence_rows
+            if _normalize_address_input(row.get("adres") or "") == normalized_query
+        ]
     sorted_deal_intelligence_rows = _sort_deal_intelligence_rows(deal_intelligence_rows, sort_choice)
+
+    if isinstance(exact_address_query, str) and exact_address_query.strip():
+        st.caption(f"Exacte adresfilter actief: {len(sorted_deal_intelligence_rows)} resultaat/resultaten.")
 
     st.markdown("#### Deal Intelligence Pro tabel")
     _render_rows_with_columns(
@@ -3368,6 +3415,9 @@ def _render_deal_finder_page():
                 "woz_difference_eur": _format_currency(row.get("asking_price_minus_woz_value")) if row.get("asking_price_minus_woz_value") is not None else "Niet beschikbaar",
                 "woz_difference_pct": _woz_pct_badge(_safe_number(row.get("asking_price_vs_woz_percentage"))),
                 "days_on_market": row.get("days_on_market") if row.get("days_on_market") is not None else "Onbekend",
+                "listed_since": row.get("listed_since") or "Onbekend",
+                "asking_price_status": row.get("asking_price_status") or "unknown",
+                "asking_price_text": row.get("asking_price_text") or "",
                 "price_reductions": row.get("price_reduction_count") if row.get("price_reduction_count") is not None else 0,
                 "previous_asking_prices": row.get("vorige_vraagprijzen") or "Onbekend",
                 "split_potential": row.get("split_potential") if row.get("split_potential") is not None else "Onbekend",
@@ -3377,6 +3427,8 @@ def _render_deal_finder_page():
                 "investment_score": row.get("investment_score") if row.get("investment_score") is not None else "Onbekend",
                 "opportunity_score": row.get("opportunity_score") if row.get("opportunity_score") is not None else "Onbekend",
                 "recommendation": row.get("investment_recommendation") or "★ Avoid",
+                "source_timestamp": row.get("source_timestamp") or "Onbekend",
+                "source_url": row.get("source_url") or "",
             }
             for row in sorted_deal_intelligence_rows
         ],
@@ -3384,6 +3436,8 @@ def _render_deal_finder_page():
             ("Adres", "address"),
             ("Plaats", "city"),
             ("Vraagprijs", "price"),
+            ("Vraagprijs status", "asking_price_status"),
+            ("Vraagprijs tekst", "asking_price_text"),
             ("Woonoppervlak", "living_area"),
             ("Funda woonoppervlak", "funda_living_area"),
             ("BAG-oppervlak", "bag_living_area"),
@@ -3406,6 +3460,7 @@ def _render_deal_finder_page():
             ("WOZ-jaar", "woz_valuation_year"),
             ("Verschil €", "woz_difference_eur"),
             ("Verschil %", "woz_difference_pct"),
+            ("Online sinds", "listed_since"),
             ("Dagen op markt", "days_on_market"),
             ("Prijsverlagingen", "price_reductions"),
             ("Vorige vraagprijzen", "previous_asking_prices"),
@@ -3416,6 +3471,8 @@ def _render_deal_finder_page():
             ("Investment score", "investment_score"),
             ("Opportunity score", "opportunity_score"),
             ("Investeringsadvies", "recommendation"),
+            ("Bron timestamp", "source_timestamp"),
+            ("Bron URL", "source_url"),
         ],
         empty_message="Geen Deal Intelligence data beschikbaar.",
     )

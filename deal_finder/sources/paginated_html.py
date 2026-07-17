@@ -15,6 +15,10 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_TIMEOUT_SECONDS = 12
 DEFAULT_MAX_PAGES = 1000
 DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; PropertyHunterAI-DealFinder/1.0)"
+LIVE_REFRESH_HEADERS = {
+    "Cache-Control": "no-cache, no-store, max-age=0",
+    "Pragma": "no-cache",
+}
 
 
 class PaginatedHtmlListingAdapter(ListingSourceAdapter):
@@ -79,6 +83,7 @@ class PaginatedHtmlListingAdapter(ListingSourceAdapter):
         start_url = str(configuration.get("start_url") or self.default_start_url).strip()
         max_pages = _to_int(configuration.get("max_pages"), default=DEFAULT_MAX_PAGES, minimum=1, maximum=1000)
         timeout_seconds = _to_float(configuration.get("timeout_seconds"), default=DEFAULT_TIMEOUT_SECONDS, minimum=1.0, maximum=60.0)
+        force_refresh = bool(configuration.get("force_refresh"))
 
         records: list[dict[str, Any]] = []
         visited_page_urls: set[str] = set()
@@ -99,7 +104,7 @@ class PaginatedHtmlListingAdapter(ListingSourceAdapter):
 
             page_index += 1
             try:
-                html = self._fetch_html(next_url, timeout_seconds=timeout_seconds)
+                html = self._fetch_html_respecting_refresh(next_url, timeout_seconds=timeout_seconds, force_refresh=force_refresh)
                 soup = BeautifulSoup(html, "html.parser")
             except Exception as error:
                 LOGGER.warning("%s page fetch failed url=%s error=%s", self.source_name, next_url, error)
@@ -115,7 +120,7 @@ class PaginatedHtmlListingAdapter(ListingSourceAdapter):
                 visited_listing_urls.add(listing_url)
 
                 try:
-                    listing_html = self._fetch_html(listing_url, timeout_seconds=timeout_seconds)
+                    listing_html = self._fetch_html_respecting_refresh(listing_url, timeout_seconds=timeout_seconds, force_refresh=force_refresh)
                     listing_record = self._extract_listing_record(source_url=listing_url, html=listing_html)
                     records.append(listing_record)
                     records_imported += 1
@@ -169,14 +174,24 @@ class PaginatedHtmlListingAdapter(ListingSourceAdapter):
             records_failed,
         )
 
-    def _fetch_html(self, url: str, timeout_seconds: float) -> str:
+    def _fetch_html(self, url: str, timeout_seconds: float, force_refresh: bool = False) -> str:
+        headers = {"User-Agent": DEFAULT_USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
+        if force_refresh:
+            headers.update(LIVE_REFRESH_HEADERS)
         response = requests.get(
             url,
-            headers={"User-Agent": DEFAULT_USER_AGENT, "Accept": "text/html,application/xhtml+xml"},
+            headers=headers,
             timeout=timeout_seconds,
         )
         response.raise_for_status()
         return response.text
+
+    def _fetch_html_respecting_refresh(self, url: str, *, timeout_seconds: float, force_refresh: bool) -> str:
+        try:
+            return self._fetch_html(url, timeout_seconds=timeout_seconds, force_refresh=force_refresh)
+        except TypeError:
+            # Backwards-compatible path for tests/mocks with legacy signature.
+            return self._fetch_html(url, timeout_seconds=timeout_seconds)
 
     def _absolute_url(self, base_url: str, href: str | None) -> str | None:
         if not isinstance(href, str) or not href.strip():
