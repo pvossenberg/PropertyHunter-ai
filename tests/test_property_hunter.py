@@ -15,6 +15,8 @@ from app import (
     _investment_intelligence_rating,
     _label_score,
     _load_funda_place_options,
+    _merge_scan_cities,
+    _selected_municipality_summary,
     _run_funda_scan_from_ui,
     _run_source_scan,
     _render_analysis_result,
@@ -38,7 +40,7 @@ class PropertyHunterTests(unittest.TestCase):
         try:
             with patch.object(
                 app_module,
-                "fetch_dutch_municipalities",
+                "get_dutch_municipalities",
                 return_value=["Rotterdam", " Utrecht ", "Eindhoven", "Groningen", "Amsterdam"],
             ):
                 options = _load_funda_place_options()
@@ -55,9 +57,8 @@ class PropertyHunterTests(unittest.TestCase):
     def test_build_funda_start_url_uses_selected_municipality(self):
         expected_by_city = {
             "Rotterdam": "rotterdam",
-            "Utrecht": "utrecht",
-            "Eindhoven": "eindhoven",
-            "Groningen": "groningen",
+            "’s-Hertogenbosch": "s-hertogenbosch",
+            "Súdwest-Fryslân": "sudwest-fryslan",
         }
 
         for city, expected_slug in expected_by_city.items():
@@ -70,6 +71,14 @@ class PropertyHunterTests(unittest.TestCase):
             query = parse_qs(urlparse(url).query)
             selected_area = json.loads(query["selected_area"][0])
             self.assertEqual(selected_area, [expected_slug])
+
+    def test_merge_scan_cities_multiselect_processing_removes_duplicates(self):
+        merged = _merge_scan_cities(["Rotterdam", " Utrecht ", "rotterdam", "", "Eindhoven"], " Utrecht")
+        self.assertEqual(merged, ["Rotterdam", "Utrecht", "Eindhoven"])
+
+    def test_selected_municipality_summary_formats_first_five_and_remainder(self):
+        summary = _selected_municipality_summary(["A", "B", "C", "D", "E", "F", "G"])
+        self.assertEqual(summary, "7 gemeenten geselecteerd: A, B, C, D, E en nog 2 gemeenten")
 
     def test_funda_scan_dry_run_uses_selected_municipalities_for_queries(self):
         import app as app_module
@@ -115,6 +124,7 @@ class PropertyHunterTests(unittest.TestCase):
 
         self.assertEqual(result["mode"], "dry-run")
         self.assertEqual(len(captured_start_urls), len(selected_cities))
+        self.assertEqual(len(result.get("per_city_results") or []), len(selected_cities))
 
         selected_slugs = []
         for url in captured_start_urls:

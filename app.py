@@ -16,7 +16,7 @@ import streamlit as st
 import requests
 
 from ai.analyzer import analyze_property
-from config import FUNDA_DEFAULT_SCAN_CITIES, fetch_dutch_municipalities
+from config import FUNDA_DEFAULT_SCAN_CITIES
 from deal_finder.orchestrator import DealFinderOrchestrator
 from deal_finder.sources.funda import normalize_funda_area_slug
 from models.permit import PermitRecord
@@ -28,6 +28,7 @@ from services.calculations import calculate_days_on_market, calculate_price_chan
 from services.dashboard_service import DashboardService
 from services.comparable_sales import ComparableSalesService
 from services.database import DatabaseService
+from services.dutch_municipalities import get_dutch_municipalities
 from services.end_to_end_workflow import PropertyHunterEndToEndWorkflow
 from services.property_enrichment import PropertyEnrichmentEngine
 
@@ -1117,15 +1118,25 @@ def _load_funda_place_options() -> list[str]:
             seen.add(key)
             merged.append(normalized)
 
-    try:
-        add_places(fetch_dutch_municipalities())
-    except Exception as error:
-        LOGGER.warning("Could not refresh municipality options: %s", error)
+    add_places(get_dutch_municipalities())
 
     # Keep defaults selectable even when municipality metadata is tijdelijk niet beschikbaar.
     add_places(list(FUNDA_DEFAULT_SCAN_CITIES))
 
     return sorted(merged, key=lambda value: value.casefold())
+
+
+def _selected_municipality_summary(selected: list[str]) -> str:
+    total = len(selected)
+    if total == 0:
+        return "0 gemeenten geselecteerd"
+
+    shown = selected[:5]
+    base = f"{total} gemeenten geselecteerd: {', '.join(shown)}"
+    remaining = total - len(shown)
+    if remaining > 0:
+        return f"{base} en nog {remaining} gemeenten"
+    return base
 
 
 def _merge_scan_cities(selected_cities: list[str], custom_city: str) -> list[str]:
@@ -1497,6 +1508,7 @@ def _run_funda_scan_from_ui(
     started_at = time.perf_counter()
     per_city_results: list[dict[str, Any]] = []
     all_rows: list[dict[str, Any]] = []
+    seen_row_keys: set[str] = set()
 
     listings_found = 0
     listings_imported = 0
@@ -1556,7 +1568,13 @@ def _run_funda_scan_from_ui(
                         city_rows = []
                         city_price_reductions = 0
 
-                all_rows.extend(city_rows)
+                for row in city_rows:
+                    row_key = str(row.get("listing_id") or row.get("source_url") or f"{row.get('adres')}::{row.get('plaats')}").strip().casefold()
+                    if row_key and row_key in seen_row_keys:
+                        continue
+                    if row_key:
+                        seen_row_keys.add(row_key)
+                    all_rows.append(row)
                 price_reductions += city_price_reductions
                 per_city_results.append(
                     {
@@ -1600,7 +1618,13 @@ def _run_funda_scan_from_ui(
 
             city_listing_ids = [str(item).strip() for item in (import_result.get("listing_ids") or []) if str(item).strip()]
             city_rows, city_price_reductions = _build_rows_from_listing_ids(city_listing_ids)
-            all_rows.extend(city_rows)
+            for row in city_rows:
+                row_key = str(row.get("listing_id") or row.get("source_url") or f"{row.get('adres')}::{row.get('plaats')}").strip().casefold()
+                if row_key and row_key in seen_row_keys:
+                    continue
+                if row_key:
+                    seen_row_keys.add(row_key)
+                all_rows.append(row)
             price_reductions += city_price_reductions
 
             per_city_results.append(
@@ -3116,23 +3140,42 @@ def _render_deal_finder_page():
     _deal_finder_marker("manual_import_section_done")
 
     st.markdown("### Funda scan")
-    st.caption("Start een stadsgerichte Funda-scan via de bestaande orchestratieflow.")
+    st.caption("Start een gemeentegerichte Funda-scan via de bestaande orchestratieflow.")
 
     if "deal_funda_scan_running" not in st.session_state:
         st.session_state["deal_funda_scan_running"] = False
 
+    available_places = _load_funda_place_options()
+    if "deal_funda_scan_cities" not in st.session_state:
+        st.session_state["deal_funda_scan_cities"] = [city for city in FUNDA_DEFAULT_SCAN_CITIES if city in available_places]
+
     scan_col_1, scan_col_2 = st.columns(2)
     with scan_col_1:
-        available_places = _load_funda_place_options()
         selected_cities = st.multiselect(
             "Gemeenten (zoekbaar)",
             options=available_places,
-            default=[city for city in FUNDA_DEFAULT_SCAN_CITIES if city in available_places],
             key="deal_funda_scan_cities",
             help="Typ om een Nederlandse gemeente te zoeken en selecteer er meerdere.",
         )
+
+        selection_col_1, selection_col_2 = st.columns(2)
+        with selection_col_1:
+            select_all_clicked = st.button("Selecteer alle gemeenten", key="deal_funda_scan_select_all")
+        with selection_col_2:
+            clear_selection_clicked = st.button("Wis selectie", key="deal_funda_scan_clear_selection")
+
+        if select_all_clicked:
+            st.session_state["deal_funda_scan_cities"] = list(available_places)
+            st.rerun()
+        if clear_selection_clicked:
+            st.session_state["deal_funda_scan_cities"] = []
+            st.rerun()
+
         scan_cities = _merge_scan_cities([str(city) for city in selected_cities], "")
-        st.caption(f"Geselecteerde plaatsen: {', '.join(scan_cities) if scan_cities else 'geen'}")
+        st.caption(_selected_municipality_summary(scan_cities))
+        if len(scan_cities) > 25:
+            st.warning("Een landelijke of zeer brede scan kan lang duren en veel scraperverbruik veroorzaken.")
+
         min_price_scan = st.number_input("Minimale vraagprijs", min_value=0, value=0, step=1000, key="deal_funda_scan_min_price")
         max_price_scan = st.number_input("Maximale vraagprijs", min_value=0, value=0, step=1000, key="deal_funda_scan_max_price")
     with scan_col_2:
