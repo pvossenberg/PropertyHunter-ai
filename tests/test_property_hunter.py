@@ -3,14 +3,18 @@ from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import json
+from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
 
 from ai.analyzer import PROPERTY_ANALYSIS_SCHEMA, REQUIRED_KEYS, _infer_asking_price_fields, analyze_property, _validate_analysis_payload
 from app import (
+    _build_funda_start_url,
     _build_investment_intelligence,
     _format_currency,
     _format_number,
     _investment_intelligence_rating,
     _label_score,
+    _load_funda_place_options,
     _run_funda_scan_from_ui,
     _run_source_scan,
     _render_analysis_result,
@@ -27,6 +31,101 @@ from services.calculations import calculate_days_on_market, calculate_discount_p
 
 
 class PropertyHunterTests(unittest.TestCase):
+    def test_load_funda_place_options_uses_municipalities_and_keeps_defaults(self):
+        import app as app_module
+
+        _load_funda_place_options.clear()
+        try:
+            with patch.object(
+                app_module,
+                "fetch_dutch_municipalities",
+                return_value=["Rotterdam", " Utrecht ", "Eindhoven", "Groningen", "Amsterdam"],
+            ):
+                options = _load_funda_place_options()
+        finally:
+            _load_funda_place_options.clear()
+
+        self.assertIn("Breda", options)
+        self.assertIn("Amsterdam", options)
+        self.assertIn("Rotterdam", options)
+        self.assertIn("Utrecht", options)
+        self.assertIn("Eindhoven", options)
+        self.assertIn("Groningen", options)
+
+    def test_build_funda_start_url_uses_selected_municipality(self):
+        expected_by_city = {
+            "Rotterdam": "rotterdam",
+            "Utrecht": "utrecht",
+            "Eindhoven": "eindhoven",
+            "Groningen": "groningen",
+        }
+
+        for city, expected_slug in expected_by_city.items():
+            url = _build_funda_start_url(
+                city,
+                min_price=250000,
+                max_price=650000,
+                min_living_area=80,
+            )
+            query = parse_qs(urlparse(url).query)
+            selected_area = json.loads(query["selected_area"][0])
+            self.assertEqual(selected_area, [expected_slug])
+
+    def test_funda_scan_dry_run_uses_selected_municipalities_for_queries(self):
+        import app as app_module
+
+        selected_cities = ["Rotterdam", "Utrecht", "Eindhoven", "Groningen"]
+        captured_start_urls: list[str] = []
+
+        class FakeDatabaseServiceCtor:
+            def __init__(self):
+                self.is_enabled = False
+
+        def fake_run_source_scan(source_name, **kwargs):
+            self.assertEqual(source_name, "funda")
+            captured_start_urls.append(str(kwargs.get("start_url") or ""))
+            return {
+                "ok": True,
+                "listings_found": 1,
+                "listings_imported": 1,
+                "listings_failed": 0,
+                "output_path": "",
+            }
+
+        original_run_source_scan = app_module._run_source_scan
+        original_probe_http_status = app_module._probe_http_status
+        original_database_service_cls = app_module.DatabaseService
+        try:
+            app_module._run_source_scan = fake_run_source_scan
+            app_module._probe_http_status = lambda url, timeout_seconds=12.0: (200, None)
+            app_module.DatabaseService = FakeDatabaseServiceCtor
+
+            result = _run_funda_scan_from_ui(
+                cities=selected_cities,
+                min_price=250000,
+                max_price=650000,
+                min_living_area=80,
+                max_pages_per_city=1,
+                dry_run=True,
+            )
+        finally:
+            app_module._run_source_scan = original_run_source_scan
+            app_module._probe_http_status = original_probe_http_status
+            app_module.DatabaseService = original_database_service_cls
+
+        self.assertEqual(result["mode"], "dry-run")
+        self.assertEqual(len(captured_start_urls), len(selected_cities))
+
+        selected_slugs = []
+        for url in captured_start_urls:
+            query = parse_qs(urlparse(url).query)
+            selected_slugs.extend(json.loads(query["selected_area"][0]))
+
+        self.assertIn("rotterdam", selected_slugs)
+        self.assertIn("utrecht", selected_slugs)
+        self.assertIn("eindhoven", selected_slugs)
+        self.assertIn("groningen", selected_slugs)
+
     def test_run_source_scan_writes_json_and_counts_results(self):
         class FakeDatabaseService:
             def __init__(self):

@@ -4,6 +4,7 @@ from datetime import date, datetime, timezone
 import logging
 import re
 from typing import Any
+import unicodedata
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -697,6 +698,19 @@ def _extract_city_from_jsonld_address(address_value: Any) -> str | None:
     if not isinstance(address_value, dict):
         return None
     return _as_optional_str(address_value.get("addressLocality") or address_value.get("city"))
+
+
+def normalize_funda_area_slug(city: str) -> str:
+    raw_value = str(city or "").strip().lower()
+    if not raw_value:
+        return ""
+
+    normalized = unicodedata.normalize("NFKD", raw_value)
+    ascii_value = normalized.encode("ascii", "ignore").decode("ascii")
+    ascii_value = ascii_value.replace("'", "")
+    ascii_value = re.sub(r"[^a-z0-9\-\s]", " ", ascii_value)
+    ascii_value = re.sub(r"[\s\-]+", "-", ascii_value).strip("-")
+    return ascii_value
 
 
 def _looks_like_funda_listing_url(url: str) -> bool:
