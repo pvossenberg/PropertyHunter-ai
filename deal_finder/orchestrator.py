@@ -439,7 +439,13 @@ class DealFinderOrchestrator:
             "record_results": record_results,
         }
 
-    def _enrich_listing_with_public_data(self, *, listing_row: dict[str, Any], source_name: str) -> tuple[dict[str, Any], list[str]]:
+    def _enrich_listing_with_public_data(
+        self,
+        *,
+        listing_row: dict[str, Any],
+        source_name: str,
+        persist: bool = True,
+    ) -> tuple[dict[str, Any], list[str]]:
         warnings: list[str] = []
         source_url = str(listing_row.get("source_url") or "").strip()
         if not source_url:
@@ -459,16 +465,19 @@ class DealFinderOrchestrator:
             "municipality": raw_payload.get("municipality"),
             "raw_extracted_data": raw_payload,
         }
-        property_row = self.database_service.upsert_property(property_payload)
-        property_id = str(property_row.get("id") or "").strip()
-        if not property_id:
-            warnings.append(f"{source_url}: WOZ enrichment unavailable, property row could not be persisted.")
-            return listing_row, warnings
+        property_row: dict[str, Any] = {}
+        property_id = str(listing_row.get("property_id") or "").strip()
+        if persist:
+            property_row = self.database_service.upsert_property(property_payload)
+            property_id = str(property_row.get("id") or "").strip()
+            if not property_id:
+                warnings.append(f"{source_url}: BAG/WOZ enrichment unavailable, property row could not be persisted.")
+                return listing_row, warnings
 
         enrichment_result = self.property_enrichment_engine.enrich(
             Property(
                 source_url=source_url,
-                listing_id=property_id,
+                listing_id=property_id or str(listing_row.get("id") or "").strip() or None,
                 title=property_payload.get("title"),
                 address=property_payload.get("address"),
                 city=property_payload.get("city"),
@@ -483,26 +492,45 @@ class DealFinderOrchestrator:
             )
         )
 
-        self.database_service.upsert_property_enrichment_group(
-            property_id=property_id,
-            status="completed",
-            started_at=enrichment_result.started_at,
-            completed_at=enrichment_result.completed_at,
-            source=source_name,
-            warning_count=sum(1 for item in enrichment_result.items if not item.success),
-            error_count=sum(1 for item in enrichment_result.items if not item.success),
-            summary={"enrichment_count": len(enrichment_result.items)},
-        )
+        if persist:
+            self.database_service.upsert_property_enrichment_group(
+                property_id=property_id,
+                status="completed",
+                started_at=enrichment_result.started_at,
+                completed_at=enrichment_result.completed_at,
+                source=source_name,
+                warning_count=sum(1 for item in enrichment_result.items if not item.success),
+                error_count=sum(1 for item in enrichment_result.items if not item.success),
+                summary={"enrichment_count": len(enrichment_result.items)},
+            )
 
-        self.database_service.batch_upsert_property_enrichments(
-            property_id=property_id,
-            enrichments=[item.to_dict() for item in enrichment_result.items],
-        )
+            self.database_service.batch_upsert_property_enrichments(
+                property_id=property_id,
+                enrichments=[item.to_dict() for item in enrichment_result.items],
+            )
 
         items_by_key = {item.enrichment_key: item for item in enrichment_result.items}
         woz_item = items_by_key.get("latest_woz_value")
         valuation_year_item = items_by_key.get("woz_valuation_year")
         bag_id_item = items_by_key.get("bag_id")
+        bag_address_item = items_by_key.get("bag_address_id")
+        bag_vbo_item = items_by_key.get("bag_verblijfsobject_id")
+        bag_pand_item = items_by_key.get("bag_pand_id")
+        bag_building_year_item = items_by_key.get("bag_building_year")
+        bag_usage_item = items_by_key.get("bag_usage_purpose")
+        bag_status_item = items_by_key.get("bag_status")
+        bag_floor_item = items_by_key.get("bag_official_floor_area_m2")
+        bag_confidence_item = items_by_key.get("bag_confidence_score")
+        bag_source_item = items_by_key.get("bag_source")
+        bag_retrieval_item = items_by_key.get("bag_retrieval_date")
+        bag_quality_item = items_by_key.get("bag_quality_flags")
+        funda_area_item = items_by_key.get("funda_living_area_m2")
+        diff_m2_item = items_by_key.get("living_area_difference_m2")
+        diff_pct_item = items_by_key.get("living_area_difference_percentage")
+        calc_area_item = items_by_key.get("calculation_area_m2")
+        calc_area_source_item = items_by_key.get("calculation_area_source")
+        asking_price_per_m2_item = items_by_key.get("asking_price_per_m2")
+        woz_per_m2_item = items_by_key.get("woz_value_per_m2")
 
         woz_value = _safe_float(woz_item.value) if woz_item else None
         if woz_value is None:
@@ -511,6 +539,34 @@ class DealFinderOrchestrator:
         updated_raw_payload = {
             **raw_payload,
             "bag_id": bag_id_item.value if bag_id_item else raw_payload.get("bag_id"),
+            "bag_address_id": bag_address_item.value if bag_address_item else raw_payload.get("bag_address_id"),
+            "bag_verblijfsobject_id": bag_vbo_item.value if bag_vbo_item else raw_payload.get("bag_verblijfsobject_id"),
+            "bag_pand_id": bag_pand_item.value if bag_pand_item else raw_payload.get("bag_pand_id"),
+            "bag_building_year": _safe_int(bag_building_year_item.value) if bag_building_year_item else raw_payload.get("bag_building_year"),
+            "construction_year_bag": _safe_int(bag_building_year_item.value) if bag_building_year_item else raw_payload.get("construction_year_bag") or raw_payload.get("bag_building_year"),
+            "bag_usage_purpose": bag_usage_item.value if bag_usage_item else raw_payload.get("bag_usage_purpose"),
+            "usage_purpose": bag_usage_item.value if bag_usage_item else raw_payload.get("usage_purpose") or raw_payload.get("bag_usage_purpose"),
+            "bag_status": bag_status_item.value if bag_status_item else raw_payload.get("bag_status"),
+            "bag_official_floor_area_m2": _safe_float(bag_floor_item.value) if bag_floor_item else raw_payload.get("bag_official_floor_area_m2"),
+            "official_floor_area_m2": _safe_float(bag_floor_item.value) if bag_floor_item else raw_payload.get("official_floor_area_m2") or raw_payload.get("bag_official_floor_area_m2"),
+            "coordinates": {
+                "rd": raw_payload.get("bag_coordinates_rd"),
+                "ll": raw_payload.get("bag_coordinates_ll"),
+            },
+            "bag_confidence_score": _safe_int(bag_confidence_item.value) if bag_confidence_item else raw_payload.get("bag_confidence_score"),
+            "confidence_score": _safe_int(bag_confidence_item.value) if bag_confidence_item else raw_payload.get("confidence_score") or raw_payload.get("bag_confidence_score"),
+            "bag_source": bag_source_item.value if bag_source_item else raw_payload.get("bag_source"),
+            "source": bag_source_item.value if bag_source_item else raw_payload.get("source") or raw_payload.get("bag_source"),
+            "bag_retrieval_date": bag_retrieval_item.value if bag_retrieval_item else raw_payload.get("bag_retrieval_date"),
+            "retrieval_date": bag_retrieval_item.value if bag_retrieval_item else raw_payload.get("retrieval_date") or raw_payload.get("bag_retrieval_date"),
+            "bag_quality_flags": bag_quality_item.value if bag_quality_item else raw_payload.get("bag_quality_flags") or [],
+            "funda_living_area_m2": _safe_float(funda_area_item.value) if funda_area_item else raw_payload.get("funda_living_area_m2"),
+            "living_area_difference_m2": _safe_float(diff_m2_item.value) if diff_m2_item else raw_payload.get("living_area_difference_m2"),
+            "living_area_difference_percentage": _safe_float(diff_pct_item.value) if diff_pct_item else raw_payload.get("living_area_difference_percentage"),
+            "calculation_area_m2": _safe_float(calc_area_item.value) if calc_area_item else raw_payload.get("calculation_area_m2"),
+            "calculation_area_source": calc_area_source_item.value if calc_area_source_item else raw_payload.get("calculation_area_source"),
+            "asking_price_per_m2": _safe_float(asking_price_per_m2_item.value) if asking_price_per_m2_item else raw_payload.get("asking_price_per_m2"),
+            "woz_value_per_m2": _safe_float(woz_per_m2_item.value) if woz_per_m2_item else raw_payload.get("woz_value_per_m2"),
             "latest_woz_value": woz_value,
             "woz_valuation_year": _safe_int(valuation_year_item.value) if valuation_year_item else raw_payload.get("woz_valuation_year"),
             "woz_retrieval_date": woz_item.retrieval_date if woz_item else None,
@@ -518,6 +574,17 @@ class DealFinderOrchestrator:
             "woz_confidence_score": woz_item.confidence_score if woz_item else 0,
             "woz_historical_values": (items_by_key.get("woz_historical_values").value if items_by_key.get("woz_historical_values") else []),
         }
+
+        transient_listing = {
+            **listing_row,
+            "property_id": property_id or listing_row.get("property_id"),
+            "raw_payload": updated_raw_payload,
+            "latest_woz_value": woz_value,
+            "woz_valuation_year": _safe_int(valuation_year_item.value) if valuation_year_item else listing_row.get("woz_valuation_year"),
+        }
+
+        if not persist:
+            return transient_listing, warnings
 
         updated_listing = self.database_service.upsert_listing(
             listing_id=str(listing_row.get("id") or "") or None,
@@ -535,7 +602,7 @@ class DealFinderOrchestrator:
             dedupe_match=type("Dedupe", (), {"matched_property_id": property_id})(),
         )
 
-        return (updated_listing or listing_row), warnings
+        return (updated_listing or transient_listing), warnings
 
     def refresh_listing_metadata(self, listing_id: str) -> dict[str, Any]:
         detail = self.database_service.get_listing_detail(listing_id)
@@ -836,8 +903,8 @@ class DealFinderOrchestrator:
             return None
 
         asking_price = _safe_float(pick("asking_price", "current_asking_price"))
-        surface_m2 = _safe_float(pick("surface_m2", "living_area"))
-        price_per_m2 = _safe_float(pick("price_per_m2"))
+        surface_m2 = _safe_float(pick("calculation_area_m2", "surface_m2", "living_area"))
+        price_per_m2 = _safe_float(pick("asking_price_per_m2", "price_per_m2"))
         if price_per_m2 is None and asking_price not in (None, 0) and surface_m2 not in (None, 0):
             price_per_m2 = round(float(asking_price) / float(surface_m2), 2)
 
@@ -848,8 +915,12 @@ class DealFinderOrchestrator:
             "property_type": pick("property_type"),
             "asking_price": asking_price,
             "surface_m2": surface_m2,
+            "calculation_area_m2": _safe_float(pick("calculation_area_m2")),
+            "calculation_area_source": _safe_text(pick("calculation_area_source")),
             "energy_label": _safe_text(pick("energy_label")).upper(),
             "construction_year": _safe_int(pick("construction_year", "bag_building_year")),
+            "bag_building_year": _safe_int(pick("bag_building_year")),
+            "usage_purpose": _safe_text(pick("bag_usage_purpose", "usage_purpose")),
             "plot_size_m2": _safe_float(pick("plot_size_m2", "plot_size")),
             "bedrooms": _safe_int(pick("bedrooms")),
             "days_on_market": _safe_int(pick("days_on_market")),

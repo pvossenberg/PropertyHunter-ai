@@ -135,6 +135,8 @@ class DatabaseServiceTests(unittest.TestCase):
         self.assertEqual(property_payload["title"], "Test Object")
         self.assertEqual(property_payload["asking_price_status"], "known")
         self.assertEqual(property_payload["bag_id"], "0363010000000001")
+        self.assertEqual(property_payload["construction_year_bag"], None)
+        self.assertEqual(property_payload["official_floor_area_m2"], None)
         self.assertEqual(property_payload["latest_woz_value"], 475000)
         self.assertEqual(property_payload["woz_valuation_year"], 2025)
 
@@ -153,6 +155,44 @@ class DatabaseServiceTests(unittest.TestCase):
         energy_label = service._build_energy_label_payload("property-id", extracted)
         self.assertIsNotNone(energy_label)
         self.assertEqual(energy_label["label"], "A")
+
+    def test_build_payloads_preserve_bag_area_aliases(self):
+        service = DatabaseService(url="", key="")
+        extracted = {
+            "source_url": "https://example.com/bag",
+            "address": "Markt 1",
+            "city": "Breda",
+            "bag_address_id": "0518200000001001",
+            "bag_verblijfsobject_id": "0518010000002001",
+            "bag_pand_id": "0518100000003001",
+            "bag_building_year": 1999,
+            "bag_usage_purpose": "woonfunctie",
+            "bag_status": "Verblijfsobject in gebruik",
+            "bag_official_floor_area_m2": 88.0,
+            "bag_coordinates_rd": {"x": 120000.0, "y": 400000.0},
+            "bag_coordinates_ll": {"longitude": 4.77, "latitude": 51.59},
+            "bag_retrieval_date": "2026-07-17T10:00:00+00:00",
+            "bag_source": "PDOK BAG WFS",
+            "bag_confidence_score": 94,
+            "bag_quality_flags": [],
+            "funda_living_area_m2": 90.0,
+            "living_area_difference_m2": 2.0,
+            "living_area_difference_percentage": 2.27,
+            "calculation_area_m2": 88.0,
+            "calculation_area_source": "BAG",
+            "asking_price_per_m2": 5000.0,
+            "woz_value_per_m2": 4600.0,
+        }
+
+        property_payload = service._build_property_payload(extracted["source_url"], extracted)
+
+        self.assertEqual(property_payload["bag_address_id"], "0518200000001001")
+        self.assertEqual(property_payload["bag_verblijfsobject_id"], "0518010000002001")
+        self.assertEqual(property_payload["construction_year_bag"], 1999)
+        self.assertEqual(property_payload["official_floor_area_m2"], 88.0)
+        self.assertEqual(property_payload["usage_purpose"], "woonfunctie")
+        self.assertEqual(property_payload["calculation_area_source"], "BAG")
+        self.assertEqual(property_payload["asking_price_per_m2"], 5000.0)
 
     def test_upsert_property_updates_existing_source_url(self):
         service = StubDatabaseService(

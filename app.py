@@ -80,15 +80,36 @@ def _property_to_scan_payload(property_obj: Property) -> dict[str, Any]:
         "postal_code": property_data.get("postal_code"),
         "municipality": property_data.get("municipality"),
         "bag_id": property_data.get("bag_id"),
+        "bag_address_id": property_data.get("bag_address_id"),
+        "bag_verblijfsobject_id": property_data.get("bag_verblijfsobject_id"),
         "bag_nummeraanduiding_id": property_data.get("bag_nummeraanduiding_id"),
         "bag_pand_id": property_data.get("bag_pand_id"),
         "bag_building_year": property_data.get("bag_building_year"),
+        "construction_year_bag": property_data.get("construction_year_bag") or property_data.get("bag_building_year"),
         "bag_usage_purpose": property_data.get("bag_usage_purpose"),
+        "usage_purpose": property_data.get("usage_purpose") or property_data.get("bag_usage_purpose"),
+        "bag_status": property_data.get("bag_status"),
         "bag_official_floor_area_m2": property_data.get("bag_official_floor_area_m2"),
+        "official_floor_area_m2": property_data.get("official_floor_area_m2") or property_data.get("bag_official_floor_area_m2"),
         "bag_coordinates_rd": property_data.get("bag_coordinates_rd"),
         "bag_coordinates_ll": property_data.get("bag_coordinates_ll"),
+        "coordinates": property_data.get("coordinates") or {"rd": property_data.get("bag_coordinates_rd"), "ll": property_data.get("bag_coordinates_ll")},
         "bag_postcode": property_data.get("bag_postcode"),
         "bag_municipality": property_data.get("bag_municipality"),
+        "bag_retrieval_date": property_data.get("bag_retrieval_date"),
+        "retrieval_date": property_data.get("retrieval_date") or property_data.get("bag_retrieval_date"),
+        "bag_source": property_data.get("bag_source"),
+        "source": property_data.get("source") or property_data.get("bag_source"),
+        "bag_confidence_score": property_data.get("bag_confidence_score"),
+        "confidence_score": property_data.get("confidence_score") or property_data.get("bag_confidence_score"),
+        "bag_quality_flags": property_data.get("bag_quality_flags") or [],
+        "funda_living_area_m2": property_data.get("funda_living_area_m2"),
+        "living_area_difference_m2": property_data.get("living_area_difference_m2"),
+        "living_area_difference_percentage": property_data.get("living_area_difference_percentage"),
+        "calculation_area_m2": property_data.get("calculation_area_m2"),
+        "calculation_area_source": property_data.get("calculation_area_source"),
+        "asking_price_per_m2": property_data.get("asking_price_per_m2"),
+        "woz_value_per_m2": property_data.get("woz_value_per_m2"),
         "woz_object_number": property_data.get("woz_object_number"),
         "latest_woz_value": property_data.get("latest_woz_value"),
         "woz_valuation_year": property_data.get("woz_valuation_year"),
@@ -180,6 +201,7 @@ def _run_source_scan(
     active_orchestrator = orchestrator or DEAL_FINDER_ORCHESTRATOR
     active_database = database_service or DATABASE_SERVICE
     active_output_dir = output_dir or Path("output") / "scan-runs"
+    scan_warnings: list[str] = []
 
     adapter = active_orchestrator.source_registry.resolve(source_name)
     if adapter is None:
@@ -197,6 +219,7 @@ def _run_source_scan(
         error = "; ".join(warnings) or "Invalid source configuration."
         print(error)
         return {"ok": False, "error": error, "warnings": warnings}
+    scan_warnings.extend(warnings)
 
     scan_started_at = time.perf_counter()
     print(f"Start scan voor source: {source_name}")
@@ -258,6 +281,43 @@ def _run_source_scan(
         report_payload = _json_safe_value(asdict(property_obj))
         if not isinstance(report_payload, dict):
             report_payload = {}
+
+        if "funda" in str(source_name).lower() and not active_database.is_enabled:
+            try:
+                enriched_listing_row, enrichment_warnings = active_orchestrator._enrich_listing_with_public_data(
+                    listing_row={
+                        "id": None,
+                        "source_id": None,
+                        "external_listing_id": property_obj.external_listing_id,
+                        "source_url": property_obj.source_url,
+                        "title": property_obj.title,
+                        "address": property_obj.address,
+                        "city": property_obj.city,
+                        "asking_price": property_obj.asking_price,
+                        "surface_m2": property_obj.surface_m2,
+                        "property_type": property_obj.property_type,
+                        "listing_status": property_obj.listing_status,
+                        "raw_payload": property_payload,
+                    },
+                    source_name=source_name,
+                    persist=False,
+                )
+                scan_warnings.extend(enrichment_warnings)
+                enriched_raw_payload = enriched_listing_row.get("raw_payload") if isinstance(enriched_listing_row.get("raw_payload"), dict) else {}
+                if enriched_raw_payload:
+                    report_payload.update(enriched_raw_payload)
+                    property_payload = {
+                        **property_payload,
+                        **enriched_raw_payload,
+                        "raw_extracted_data": {
+                            **(property_payload.get("raw_extracted_data") or {}),
+                            **enriched_raw_payload,
+                        },
+                    }
+            except Exception as error:
+                scan_warnings.append(f"{property_obj.source_url}: dry-run BAG/WOZ enrichment failed: {type(error).__name__}: {error}")
+                LOGGER.warning("Dry-run property enrichment failed for %s: %s", property_obj.source_url, error)
+
         import_status, missing_fields = _scan_import_status(report_payload)
         storage_error: str | None = None
         stored_row: dict[str, Any] = {}
@@ -340,7 +400,7 @@ def _run_source_scan(
             "listings_failed": failed_count,
             "average_import_time_seconds": average_import_time,
             "total_elapsed_seconds": total_elapsed_seconds,
-            "warnings": warnings,
+                "warnings": scan_warnings,
         },
         "properties": imported_properties,
         "failed_records": failed_records,
@@ -373,7 +433,7 @@ def _run_source_scan(
         "partially_imported": partially_imported_count,
         "listings_failed": failed_count,
         "average_import_time_seconds": average_import_time,
-        "warnings": warnings,
+            "warnings": scan_warnings,
         "failed_records": failed_records,
     }
 
@@ -756,14 +816,36 @@ def _build_deal_intelligence_rows(candidates: list[dict[str, Any]]) -> list[dict
         woz_value = _safe_number(raw_payload.get("latest_woz_value") or listing.get("latest_woz_value"))
         woz_valuation_year = _safe_score(raw_payload.get("woz_valuation_year") or listing.get("woz_valuation_year"))
         bag_id = str(raw_payload.get("bag_id") or "").strip() or None
+        bag_address_id = str(raw_payload.get("bag_address_id") or "").strip() or None
+        bag_verblijfsobject_id = str(raw_payload.get("bag_verblijfsobject_id") or "").strip() or None
+        bag_pand_id = str(raw_payload.get("bag_pand_id") or "").strip() or None
+        bag_usage_purpose = str(raw_payload.get("bag_usage_purpose") or "").strip() or None
+        bag_building_year = _safe_score(raw_payload.get("bag_building_year"))
+        bag_confidence_score = _safe_score(raw_payload.get("bag_confidence_score"))
+        bag_quality_flags = raw_payload.get("bag_quality_flags") if isinstance(raw_payload.get("bag_quality_flags"), list) else []
         woz_source = str(raw_payload.get("woz_source") or "").strip() or None
         woz_retrieval_date = str(raw_payload.get("woz_retrieval_date") or "").strip() or None
 
         row["woz_value"] = woz_value
         row["woz_valuation_year"] = woz_valuation_year
         row["bag_id"] = bag_id
+        row["bag_address_id"] = bag_address_id
+        row["bag_verblijfsobject_id"] = bag_verblijfsobject_id
+        row["bag_pand_id"] = bag_pand_id
+        row["bag_usage_purpose"] = bag_usage_purpose
+        row["bag_bouwjaar"] = bag_building_year
+        row["bag_confidence_score"] = bag_confidence_score
+        row["bag_quality_flags"] = [str(item) for item in bag_quality_flags if str(item).strip()]
         row["woz_source"] = woz_source
         row["woz_retrieval_date"] = woz_retrieval_date
+        row["funda_woonoppervlak"] = _safe_number(raw_payload.get("funda_living_area_m2") or row.get("funda_woonoppervlak"))
+        row["bag_oppervlak"] = _safe_number(raw_payload.get("bag_official_floor_area_m2") or row.get("bag_oppervlak"))
+        row["gebruikt_rekenoppervlak"] = _safe_number(raw_payload.get("calculation_area_m2") or row.get("gebruikt_rekenoppervlak") or row.get("woonoppervlak"))
+        row["bron_rekenoppervlak"] = str(raw_payload.get("calculation_area_source") or row.get("bron_rekenoppervlak") or "Funda")
+        row["funda_bag_verschil_m2"] = _safe_number(raw_payload.get("living_area_difference_m2") or row.get("funda_bag_verschil_m2"))
+        row["funda_bag_verschil_pct"] = _safe_number(raw_payload.get("living_area_difference_percentage") or row.get("funda_bag_verschil_pct"))
+        row["asking_price_per_m2"] = _safe_number(raw_payload.get("asking_price_per_m2") or row.get("asking_price_per_m2") or row.get("price_per_m2"))
+        row["woz_per_m2"] = _safe_number(raw_payload.get("woz_value_per_m2") or row.get("woz_per_m2"))
 
         diff_eur, diff_pct = _woz_metrics(current_price, woz_value)
         row["asking_price_minus_woz_value"] = diff_eur
@@ -864,11 +946,23 @@ def _build_propertyhunter_rows(candidates: list[dict[str, Any]]) -> list[dict[st
                 "plaats": _listing_value(listing, "city") or "Onbekend",
                 "vraagprijs": _safe_number(_listing_value(listing, "asking_price")),
                 "woonoppervlak": _safe_number(_listing_value(listing, "surface_m2", "living_area")),
+                "funda_woonoppervlak": _safe_number(_listing_value(listing, "funda_living_area_m2", "surface_m2", "living_area")),
+                "bag_oppervlak": _safe_number(_listing_value(listing, "bag_official_floor_area_m2")),
+                "gebruikt_rekenoppervlak": _safe_number(_listing_value(listing, "calculation_area_m2", "surface_m2", "living_area")),
+                "bron_rekenoppervlak": str(_listing_value(listing, "calculation_area_source") or "Funda"),
+                "funda_bag_verschil_m2": _safe_number(_listing_value(listing, "living_area_difference_m2")),
+                "funda_bag_verschil_pct": _safe_number(_listing_value(listing, "living_area_difference_percentage")),
                 "perceel": _safe_number(_listing_value(listing, "plot_size_m2", "plot_size")),
                 "slaapkamers": _safe_score(_listing_value(listing, "bedrooms")),
                 "energielabel": str(_listing_value(listing, "energy_label") or "Onbekend"),
                 "bouwjaar": _safe_score(_listing_value(listing, "construction_year", "bag_building_year")),
-                "price_per_m2": _safe_number(_listing_value(listing, "price_per_m2")),
+                "price_per_m2": _safe_number(_listing_value(listing, "asking_price_per_m2", "price_per_m2")),
+                "asking_price_per_m2": _safe_number(_listing_value(listing, "asking_price_per_m2", "price_per_m2")),
+                "woz_per_m2": _safe_number(_listing_value(listing, "woz_value_per_m2")),
+                "bag_usage_purpose": str(_listing_value(listing, "bag_usage_purpose") or ""),
+                "bag_bouwjaar": _safe_score(_listing_value(listing, "bag_building_year")),
+                "bag_confidence_score": _safe_score(_listing_value(listing, "bag_confidence_score", "confidence_score")),
+                "bag_quality_flags": _listing_value(listing, "bag_quality_flags") or [],
                 "price_reduction_count": _safe_score(_listing_value(listing, "price_reduction_count")),
                 "days_on_market": _safe_score(_listing_value(listing, "days_on_market")),
                 "listing_history": _propertyhunter_listing_history_text(listing),
@@ -970,12 +1064,24 @@ def _build_rows_from_scan_properties(properties: list[dict[str, Any]]) -> list[d
                 "plaats": value("city") or "Onbekend",
                 "vraagprijs": _safe_number(value("asking_price")),
                 "woonoppervlak": _safe_number(value("surface_m2", "living_area", "bag_official_floor_area_m2")),
+                "funda_woonoppervlak": _safe_number(value("funda_living_area_m2", "surface_m2", "living_area")),
+                "bag_oppervlak": _safe_number(value("bag_official_floor_area_m2")),
+                "gebruikt_rekenoppervlak": _safe_number(value("calculation_area_m2", "surface_m2", "living_area")),
+                "bron_rekenoppervlak": str(value("calculation_area_source") or "Funda"),
+                "funda_bag_verschil_m2": _safe_number(value("living_area_difference_m2")),
+                "funda_bag_verschil_pct": _safe_number(value("living_area_difference_percentage")),
                 "perceel": _safe_number(value("plot_size_m2", "plot_size")),
                 "slaapkamers": _safe_score(value("bedrooms")),
                 "energielabel": str(value("energy_label") or "Onbekend"),
                 "bouwjaar": _safe_score(value("construction_year", "bag_building_year")),
                 "price_reduction_count": _safe_score(value("price_reduction_count")),
-                "price_per_m2": _safe_number(value("price_per_m2")),
+                "price_per_m2": _safe_number(value("asking_price_per_m2", "price_per_m2")),
+                "asking_price_per_m2": _safe_number(value("asking_price_per_m2", "price_per_m2")),
+                "woz_per_m2": _safe_number(value("woz_value_per_m2")),
+                "bag_usage_purpose": str(value("bag_usage_purpose") or ""),
+                "bag_bouwjaar": _safe_score(value("bag_building_year")),
+                "bag_confidence_score": _safe_score(value("bag_confidence_score", "confidence_score")),
+                "bag_quality_flags": value("bag_quality_flags") or [],
                 "investment_score": None,
                 "opportunity_score": None,
                 "source_url": str(value("source_url") or ""),
@@ -1024,11 +1130,15 @@ def _build_rows_from_listing_ids(listing_ids: list[str]) -> tuple[list[dict[str,
 
 
 def _compute_row_price_per_m2(row: dict[str, Any]) -> float | None:
-    explicit = _safe_number(row.get("price_per_m2"))
+    explicit = _safe_number(row.get("asking_price_per_m2"))
+    if explicit is None:
+        explicit = _safe_number(row.get("price_per_m2"))
     if explicit is not None:
         return explicit
     price = _safe_number(row.get("vraagprijs"))
-    living_area = _safe_number(row.get("woonoppervlak"))
+    living_area = _safe_number(row.get("gebruikt_rekenoppervlak"))
+    if living_area is None:
+        living_area = _safe_number(row.get("woonoppervlak"))
     if price is None or living_area in (None, 0):
         return None
     return round(price / living_area, 2)
@@ -1232,7 +1342,6 @@ def _score_rows_with_opportunity_intelligence(rows: list[dict[str, Any]]) -> lis
             overall_score = max(0, min(100, overall_score))
             row["overall_investment_score"] = overall_score
             row["investment_recommendation"] = _deal_recommendation_from_score(overall_score)
-
     return rows
 
 
@@ -1564,11 +1673,20 @@ def _render_propertyhunter_interface_page():
                 "adres": row.get("address") or "Onbekend",
                 "plaats": row.get("city") or "Onbekend",
                 "vraagprijs": _format_currency(row.get("asking_price")),
-                "woonoppervlak": _format_number(row.get("living_area")),
+                "funda_woonoppervlak": _format_number(row.get("funda_living_area_m2")) if row.get("funda_living_area_m2") is not None else "Niet beschikbaar",
+                "bag_oppervlak": _format_number(row.get("bag_official_floor_area_m2")) if row.get("bag_official_floor_area_m2") is not None else "Niet beschikbaar",
+                "gebruikt_rekenoppervlak": _format_number(row.get("calculation_area_m2")) if row.get("calculation_area_m2") is not None else "Niet beschikbaar",
+                "bron_rekenoppervlak": row.get("calculation_area_source") or "Niet beschikbaar",
+                "vraagprijs_per_m2": _format_currency(row.get("asking_price_per_m2")) if row.get("asking_price_per_m2") is not None else "Niet beschikbaar",
+                "woz_per_m2": _format_currency(row.get("woz_value_per_m2")) if row.get("woz_value_per_m2") is not None else "Niet beschikbaar",
+                "funda_bag_verschil_m2": _format_number(row.get("living_area_difference_m2")) if row.get("living_area_difference_m2") is not None else "Niet beschikbaar",
+                "funda_bag_verschil_pct": _format_percentage(_safe_number(row.get("living_area_difference_percentage")), decimals=2) if _safe_number(row.get("living_area_difference_percentage")) is not None else "Niet beschikbaar",
                 "perceel": _format_number(row.get("plot_size")),
                 "slaapkamers": row.get("bedrooms") if row.get("bedrooms") is not None else "Onbekend",
                 "energielabel": row.get("energy_label") or "Onbekend",
                 "bouwjaar": row.get("construction_year") if row.get("construction_year") is not None else "Onbekend",
+                "bag_gebruiksdoel": row.get("bag_usage_purpose") or "Niet beschikbaar",
+                "bag_bouwjaar": row.get("bag_building_year") if row.get("bag_building_year") is not None else "Niet beschikbaar",
                 "days_on_market": row.get("days_on_market") if row.get("days_on_market") is not None else "Onbekend",
                 "investment_score": row.get("investment_score") if row.get("investment_score") is not None else "Onbekend",
                 "opportunity_score": row.get("opportunity_score") if row.get("opportunity_score") is not None else "Onbekend",
@@ -1600,11 +1718,20 @@ def _render_propertyhunter_interface_page():
             "adres",
             "plaats",
             "vraagprijs",
-            "woonoppervlak",
+            "funda_woonoppervlak",
+            "bag_oppervlak",
+            "gebruikt_rekenoppervlak",
+            "bron_rekenoppervlak",
+            "vraagprijs_per_m2",
+            "woz_per_m2",
+            "funda_bag_verschil_m2",
+            "funda_bag_verschil_pct",
             "perceel",
             "slaapkamers",
             "energielabel",
             "bouwjaar",
+            "bag_gebruiksdoel",
+            "bag_bouwjaar",
             "days_on_market",
             "investment_score",
             "opportunity_score",
@@ -1628,11 +1755,20 @@ def _render_propertyhunter_interface_page():
                 st.markdown("### Geselecteerde woning")
                 st.write(f"{selected_row.get('adres')} · {selected_row.get('plaats')}")
                 st.write(f"Vraagprijs: {selected_row.get('vraagprijs')}")
-                st.write(f"Woonoppervlak: {selected_row.get('woonoppervlak')} m²")
+                st.write(f"Funda woonoppervlak: {selected_row.get('funda_woonoppervlak')} m²")
+                st.write(f"BAG-oppervlak: {selected_row.get('bag_oppervlak')} m²")
+                st.write(f"Gebruikt rekenoppervlak: {selected_row.get('gebruikt_rekenoppervlak')} m²")
+                st.write(f"Bron rekenoppervlak: {selected_row.get('bron_rekenoppervlak')}")
+                st.write(f"Vraagprijs per m²: {selected_row.get('vraagprijs_per_m2')}")
+                st.write(f"WOZ per m²: {selected_row.get('woz_per_m2')}")
+                st.write(f"Verschil Funda/BAG m²: {selected_row.get('funda_bag_verschil_m2')}")
+                st.write(f"Verschil Funda/BAG %: {selected_row.get('funda_bag_verschil_pct')}")
                 st.write(f"Perceel: {selected_row.get('perceel')} m²")
                 st.write(f"Slaapkamers: {selected_row.get('slaapkamers')}")
                 st.write(f"Energielabel: {selected_row.get('energielabel')}")
                 st.write(f"Bouwjaar: {selected_row.get('bouwjaar')}")
+                st.write(f"BAG gebruiksdoel: {selected_row.get('bag_gebruiksdoel')}")
+                st.write(f"BAG bouwjaar: {selected_row.get('bag_bouwjaar')}")
                 st.write(f"Days on market: {selected_row.get('days_on_market')}")
                 st.write(f"Investment score: {selected_row.get('investment_score')}")
                 st.write(f"Opportunity score: {selected_row.get('opportunity_score')}")
@@ -2992,12 +3128,23 @@ def _render_deal_finder_page():
                 "city": row.get("plaats") or "Onbekend",
                 "price": _format_currency(row.get("vraagprijs")),
                 "living_area": _format_number(row.get("woonoppervlak")),
+                "funda_living_area": _format_number(row.get("funda_woonoppervlak")) if row.get("funda_woonoppervlak") is not None else "Niet beschikbaar",
+                "bag_living_area": _format_number(row.get("bag_oppervlak")) if row.get("bag_oppervlak") is not None else "Niet beschikbaar",
+                "calculation_area": _format_number(row.get("gebruikt_rekenoppervlak")) if row.get("gebruikt_rekenoppervlak") is not None else "Niet beschikbaar",
+                "calculation_source": row.get("bron_rekenoppervlak") or "Niet beschikbaar",
                 "plot_size": _format_number(row.get("perceel")),
                 "energy_label": row.get("energielabel") or "Onbekend",
                 "construction_year": row.get("bouwjaar") if row.get("bouwjaar") is not None else "Onbekend",
-                "price_per_m2": _format_currency(row.get("price_per_m2")) if row.get("price_per_m2") is not None else "Onbekend",
+                "price_per_m2": _format_currency(row.get("asking_price_per_m2") or row.get("price_per_m2")) if (row.get("asking_price_per_m2") is not None or row.get("price_per_m2") is not None) else "Niet beschikbaar",
+                "woz_per_m2": _format_currency(row.get("woz_per_m2")) if row.get("woz_per_m2") is not None else "Niet beschikbaar",
+                "funda_bag_difference_m2": _format_number(row.get("funda_bag_verschil_m2")) if row.get("funda_bag_verschil_m2") is not None else "Niet beschikbaar",
+                "funda_bag_difference_pct": _format_percentage(_safe_number(row.get("funda_bag_verschil_pct")), decimals=2) if _safe_number(row.get("funda_bag_verschil_pct")) is not None else "Niet beschikbaar",
                 "city_avg_price_per_m2": _format_currency(row.get("city_avg_price_per_m2")) if row.get("city_avg_price_per_m2") is not None else "Onbekend",
                 "difference_vs_city_avg_pct": _format_percentage(_safe_number(row.get("difference_vs_city_avg_pct")), decimals=2),
+                "bag_usage_purpose": row.get("bag_usage_purpose") or "Niet beschikbaar",
+                "bag_building_year": row.get("bag_bouwjaar") if row.get("bag_bouwjaar") is not None else "Niet beschikbaar",
+                "bag_confidence": row.get("bag_confidence_score") if row.get("bag_confidence_score") is not None else "Niet beschikbaar",
+                "bag_quality_flags": ", ".join(str(item) for item in (row.get("bag_quality_flags") or [])) or "Geen",
                 "woz_value": _format_currency(row.get("woz_value")) if row.get("woz_value") is not None else "Niet beschikbaar",
                 "woz_valuation_year": row.get("woz_valuation_year") if row.get("woz_valuation_year") is not None else "Niet beschikbaar",
                 "woz_difference_eur": _format_currency(row.get("asking_price_minus_woz_value")) if row.get("asking_price_minus_woz_value") is not None else "Niet beschikbaar",
@@ -3016,30 +3163,41 @@ def _render_deal_finder_page():
             for row in sorted_deal_intelligence_rows
         ],
         columns=[
-            ("Address", "address"),
-            ("City", "city"),
-            ("Price", "price"),
-            ("Living area", "living_area"),
-            ("Plot size", "plot_size"),
-            ("Energy label", "energy_label"),
-            ("Construction year", "construction_year"),
-            ("Price per m²", "price_per_m2"),
-            ("City avg price per m²", "city_avg_price_per_m2"),
-            ("Difference vs city avg", "difference_vs_city_avg_pct"),
-            ("WOZ value", "woz_value"),
-            ("Valuation year", "woz_valuation_year"),
-            ("Difference €", "woz_difference_eur"),
-            ("Difference %", "woz_difference_pct"),
-            ("Days on market", "days_on_market"),
-            ("Price reductions", "price_reductions"),
-            ("Previous asking prices", "previous_asking_prices"),
-            ("Split potential", "split_potential"),
-            ("Vertical extension potential", "vertical_extension_potential"),
-            ("Rental potential", "rental_potential"),
-            ("Renovation potential", "renovation_potential"),
+            ("Adres", "address"),
+            ("Plaats", "city"),
+            ("Vraagprijs", "price"),
+            ("Woonoppervlak", "living_area"),
+            ("Funda woonoppervlak", "funda_living_area"),
+            ("BAG-oppervlak", "bag_living_area"),
+            ("Gebruikt rekenoppervlak", "calculation_area"),
+            ("Bron rekenoppervlak", "calculation_source"),
+            ("Perceel", "plot_size"),
+            ("Energielabel", "energy_label"),
+            ("Bouwjaar", "construction_year"),
+            ("Vraagprijs per m²", "price_per_m2"),
+            ("WOZ per m²", "woz_per_m2"),
+            ("Verschil Funda/BAG m²", "funda_bag_difference_m2"),
+            ("Verschil Funda/BAG %", "funda_bag_difference_pct"),
+            ("Gem. prijs per m² stad", "city_avg_price_per_m2"),
+            ("Verschil t.o.v. stad", "difference_vs_city_avg_pct"),
+            ("BAG gebruiksdoel", "bag_usage_purpose"),
+            ("BAG bouwjaar", "bag_building_year"),
+            ("BAG confidence", "bag_confidence"),
+            ("BAG waarschuwingen", "bag_quality_flags"),
+            ("WOZ-waarde", "woz_value"),
+            ("WOZ-jaar", "woz_valuation_year"),
+            ("Verschil €", "woz_difference_eur"),
+            ("Verschil %", "woz_difference_pct"),
+            ("Dagen op markt", "days_on_market"),
+            ("Prijsverlagingen", "price_reductions"),
+            ("Vorige vraagprijzen", "previous_asking_prices"),
+            ("Splitsingspotentieel", "split_potential"),
+            ("Optoppotentieel", "vertical_extension_potential"),
+            ("Verhuurpotentieel", "rental_potential"),
+            ("Renovatiepotentieel", "renovation_potential"),
             ("Investment score", "investment_score"),
             ("Opportunity score", "opportunity_score"),
-            ("Investment recommendation", "recommendation"),
+            ("Investeringsadvies", "recommendation"),
         ],
         empty_message="Geen Deal Intelligence data beschikbaar.",
     )
@@ -3068,6 +3226,21 @@ def _render_deal_finder_page():
     st.write(f"Bron: {source_detail.get('name') or 'Onbekend'}")
 
     listing_raw_payload = listing_detail.get("raw_payload") if isinstance(listing_detail.get("raw_payload"), dict) else {}
+    detail_funda_area = _safe_number(listing_raw_payload.get("funda_living_area_m2") or listing_detail.get("surface_m2"))
+    detail_bag_area = _safe_number(listing_raw_payload.get("bag_official_floor_area_m2"))
+    detail_calc_area = _safe_number(listing_raw_payload.get("calculation_area_m2") or detail_funda_area)
+    detail_calc_source = str(listing_raw_payload.get("calculation_area_source") or "Funda")
+    detail_area_diff_m2 = _safe_number(listing_raw_payload.get("living_area_difference_m2"))
+    detail_area_diff_pct = _safe_number(listing_raw_payload.get("living_area_difference_percentage"))
+    detail_asking_ppm2 = _safe_number(listing_raw_payload.get("asking_price_per_m2"))
+    detail_woz_ppm2 = _safe_number(listing_raw_payload.get("woz_value_per_m2"))
+    detail_bag_usage = str(listing_raw_payload.get("bag_usage_purpose") or "")
+    detail_bag_year = _safe_score(listing_raw_payload.get("bag_building_year"))
+    detail_bag_confidence = _safe_score(listing_raw_payload.get("bag_confidence_score"))
+    detail_bag_flags = listing_raw_payload.get("bag_quality_flags") if isinstance(listing_raw_payload.get("bag_quality_flags"), list) else []
+    detail_bag_address_id = str(listing_raw_payload.get("bag_address_id") or "")
+    detail_bag_vbo_id = str(listing_raw_payload.get("bag_verblijfsobject_id") or listing_raw_payload.get("bag_id") or "")
+    detail_bag_pand_id = str(listing_raw_payload.get("bag_pand_id") or "")
     detail_woz_value = _safe_number(listing_raw_payload.get("latest_woz_value") or listing_detail.get("latest_woz_value"))
     detail_woz_year = _safe_score(listing_raw_payload.get("woz_valuation_year") or listing_detail.get("woz_valuation_year"))
     detail_woz_source = str(listing_raw_payload.get("woz_source") or "Kadaster WOZ-waardeloket")
@@ -3083,6 +3256,23 @@ def _render_deal_finder_page():
     st.write(f"WOZ source: {detail_woz_source}")
     st.write(f"Retrieval date: {detail_woz_retrieval_date}")
     st.caption("WOZ is een historische belastingwaardering en geen actuele marktwaardering.")
+
+    st.markdown("#### BAG en oppervlakte details")
+    st.write(f"BAG nummeraanduiding ID: {detail_bag_address_id or 'Niet beschikbaar'}")
+    st.write(f"BAG verblijfsobject ID: {detail_bag_vbo_id or 'Niet beschikbaar'}")
+    st.write(f"BAG pand ID: {detail_bag_pand_id or 'Niet beschikbaar'}")
+    st.write(f"Funda woonoppervlak: {_format_number(detail_funda_area) if detail_funda_area is not None else 'Niet beschikbaar'} m²")
+    st.write(f"BAG-oppervlak: {_format_number(detail_bag_area) if detail_bag_area is not None else 'Niet beschikbaar'} m²")
+    st.write(f"Gebruikt rekenoppervlak: {_format_number(detail_calc_area) if detail_calc_area is not None else 'Niet beschikbaar'} m²")
+    st.write(f"Bron rekenoppervlak: {detail_calc_source or 'Niet beschikbaar'}")
+    st.write(f"Verschil Funda/BAG m²: {_format_number(detail_area_diff_m2) if detail_area_diff_m2 is not None else 'Niet beschikbaar'}")
+    st.write(f"Verschil Funda/BAG %: {_format_percentage(detail_area_diff_pct, decimals=2) if detail_area_diff_pct is not None else 'Niet beschikbaar'}")
+    st.write(f"Vraagprijs per m²: {_format_currency(detail_asking_ppm2) if detail_asking_ppm2 is not None else 'Niet beschikbaar'}")
+    st.write(f"WOZ per m²: {_format_currency(detail_woz_ppm2) if detail_woz_ppm2 is not None else 'Niet beschikbaar'}")
+    st.write(f"BAG gebruiksdoel: {detail_bag_usage or 'Niet beschikbaar'}")
+    st.write(f"BAG bouwjaar: {detail_bag_year if detail_bag_year is not None else 'Niet beschikbaar'}")
+    st.write(f"BAG matching confidence: {detail_bag_confidence if detail_bag_confidence is not None else 'Niet beschikbaar'}")
+    st.write(f"Data-kwaliteit waarschuwingen: {', '.join(str(item) for item in detail_bag_flags) if detail_bag_flags else 'Geen'}")
 
     deal_score = _safe_score((selected_candidate or {}).get("score"))
     if deal_score is None:

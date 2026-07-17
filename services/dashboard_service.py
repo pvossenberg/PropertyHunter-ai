@@ -96,6 +96,22 @@ class DashboardPropertyRow:
     source_name: str | None = None
     source_url: str | None = None
     bag_id: str | None = None
+    bag_address_id: str | None = None
+    bag_verblijfsobject_id: str | None = None
+    bag_pand_id: str | None = None
+    bag_usage_purpose: str | None = None
+    bag_building_year: int | None = None
+    bag_status: str | None = None
+    bag_official_floor_area_m2: float | None = None
+    funda_living_area_m2: float | None = None
+    calculation_area_m2: float | None = None
+    calculation_area_source: str | None = None
+    living_area_difference_m2: float | None = None
+    living_area_difference_percentage: float | None = None
+    asking_price_per_m2: float | None = None
+    woz_value_per_m2: float | None = None
+    bag_confidence_score: int | None = None
+    bag_quality_flags: list[str] = field(default_factory=list)
     woz_value: float | None = None
     woz_valuation_year: int | None = None
     asking_price_minus_woz_value: float | None = None
@@ -120,6 +136,22 @@ class DashboardPropertyRow:
             "source_name": self.source_name,
             "source_url": self.source_url,
             "bag_id": self.bag_id,
+            "bag_address_id": self.bag_address_id,
+            "bag_verblijfsobject_id": self.bag_verblijfsobject_id,
+            "bag_pand_id": self.bag_pand_id,
+            "bag_usage_purpose": self.bag_usage_purpose,
+            "bag_building_year": self.bag_building_year,
+            "bag_status": self.bag_status,
+            "bag_official_floor_area_m2": self.bag_official_floor_area_m2,
+            "funda_living_area_m2": self.funda_living_area_m2,
+            "calculation_area_m2": self.calculation_area_m2,
+            "calculation_area_source": self.calculation_area_source,
+            "living_area_difference_m2": self.living_area_difference_m2,
+            "living_area_difference_percentage": self.living_area_difference_percentage,
+            "asking_price_per_m2": self.asking_price_per_m2,
+            "woz_value_per_m2": self.woz_value_per_m2,
+            "bag_confidence_score": self.bag_confidence_score,
+            "bag_quality_flags": list(self.bag_quality_flags),
             "woz_value": self.woz_value,
             "woz_valuation_year": self.woz_valuation_year,
             "asking_price_minus_woz_value": self.asking_price_minus_woz_value,
@@ -305,6 +337,22 @@ class DashboardService:
             source_name=_first_text(source.get("name"), listing.get("source_name"), payload.get("source_name")),
             source_url=_first_text(listing.get("source_url"), payload.get("source_url")),
             bag_id=_first_text(payload.get("bag_id")),
+            bag_address_id=_first_text(payload.get("bag_address_id")),
+            bag_verblijfsobject_id=_first_text(payload.get("bag_verblijfsobject_id")),
+            bag_pand_id=_first_text(payload.get("bag_pand_id")),
+            bag_usage_purpose=_first_text(payload.get("bag_usage_purpose")),
+            bag_building_year=_as_int(payload.get("bag_building_year")),
+            bag_status=_first_text(payload.get("bag_status")),
+            bag_official_floor_area_m2=_as_float(payload.get("bag_official_floor_area_m2")),
+            funda_living_area_m2=_as_float(payload.get("funda_living_area_m2") or payload.get("living_area") or payload.get("surface_m2")),
+            calculation_area_m2=_as_float(payload.get("calculation_area_m2") or payload.get("surface_m2")),
+            calculation_area_source=_first_text(payload.get("calculation_area_source")),
+            living_area_difference_m2=_as_float(payload.get("living_area_difference_m2")),
+            living_area_difference_percentage=_as_float(payload.get("living_area_difference_percentage")),
+            asking_price_per_m2=_as_float(payload.get("asking_price_per_m2") or payload.get("price_per_m2")),
+            woz_value_per_m2=_as_float(payload.get("woz_value_per_m2")),
+            bag_confidence_score=_as_int(payload.get("bag_confidence_score")),
+            bag_quality_flags=[str(item) for item in _as_list(payload.get("bag_quality_flags")) if str(item).strip()],
             woz_value=woz_value,
             woz_valuation_year=_as_int(payload.get("woz_valuation_year") or listing.get("woz_valuation_year")),
             asking_price_minus_woz_value=asking_minus_woz,
@@ -350,6 +398,22 @@ class DashboardService:
             source_name=source_text,
             source_url=_first_text(payload.get("source_url"), item.get("source_url")),
             bag_id=_first_text(payload.get("bag_id")),
+            bag_address_id=_first_text(payload.get("bag_address_id")),
+            bag_verblijfsobject_id=_first_text(payload.get("bag_verblijfsobject_id")),
+            bag_pand_id=_first_text(payload.get("bag_pand_id")),
+            bag_usage_purpose=_first_text(payload.get("bag_usage_purpose")),
+            bag_building_year=_as_int(payload.get("bag_building_year")),
+            bag_status=_first_text(payload.get("bag_status")),
+            bag_official_floor_area_m2=_as_float(payload.get("bag_official_floor_area_m2")),
+            funda_living_area_m2=_as_float(payload.get("funda_living_area_m2") or payload.get("living_area") or payload.get("surface_m2")),
+            calculation_area_m2=_as_float(payload.get("calculation_area_m2") or payload.get("surface_m2")),
+            calculation_area_source=_first_text(payload.get("calculation_area_source")),
+            living_area_difference_m2=_as_float(payload.get("living_area_difference_m2")),
+            living_area_difference_percentage=_as_float(payload.get("living_area_difference_percentage")),
+            asking_price_per_m2=_as_float(payload.get("asking_price_per_m2") or payload.get("price_per_m2")),
+            woz_value_per_m2=_as_float(payload.get("woz_value_per_m2")),
+            bag_confidence_score=_as_int(payload.get("bag_confidence_score")),
+            bag_quality_flags=[str(item) for item in _as_list(payload.get("bag_quality_flags")) if str(item).strip()],
             woz_value=woz_value,
             woz_valuation_year=_as_int(payload.get("woz_valuation_year")),
             asking_price_minus_woz_value=asking_minus_woz,

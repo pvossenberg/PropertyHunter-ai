@@ -67,14 +67,47 @@ class PropertyEnrichmentEngineTests(unittest.TestCase):
         result = engine.enrich(property_obj)
         items_by_key = {item.enrichment_key: item for item in result.items}
 
-        self.assertEqual(len(result.items), 25)
+        self.assertEqual(len(result.items), 39)
         self.assertEqual(items_by_key["postal_code"].value, "1015 AB")
         self.assertEqual(items_by_key["municipality"].value, "Amsterdam")
         self.assertEqual(items_by_key["monument_status"].value, "monument")
         self.assertEqual(items_by_key["bag_id"].value, "0363010000000001")
         self.assertEqual(items_by_key["latest_woz_value"].value, 650000.0)
+        self.assertEqual(items_by_key["calculation_area_m2"].value, 100.0)
+        self.assertEqual(items_by_key["calculation_area_source"].value, "BAG")
+        self.assertEqual(items_by_key["asking_price_per_m2"].value, 7500.0)
+        self.assertEqual(items_by_key["woz_value_per_m2"].value, 6500.0)
         self.assertIn("distance_to_city_center", items_by_key)
         self.assertTrue(all("retrieval_date" in item.to_dict() for item in result.items))
+
+    def test_falls_back_to_funda_area_when_bag_match_is_low_confidence(self):
+        class LowConfidenceBagService(StubPublicDataService):
+            async def fetch_bag_snapshot(self, property_obj):
+                result = await super().fetch_bag_snapshot(property_obj)
+                result["confidence_score"] = 45
+                result["quality_flags"] = ["low_confidence_match", "missing_official_area"]
+                return result
+
+        engine = PropertyEnrichmentEngine(public_data_service=LowConfidenceBagService())
+        property_obj = Property(
+            source_url="https://example.com/p5",
+            listing_id="p5",
+            address="Herengracht 5",
+            city="Amsterdam",
+            postal_code="1015 AB",
+            municipality="Amsterdam",
+            asking_price=600000,
+            surface_m2=96,
+            property_type="Appartement",
+        )
+
+        result = engine.enrich(property_obj)
+        items_by_key = {item.enrichment_key: item for item in result.items}
+
+        self.assertEqual(items_by_key["calculation_area_m2"].value, 96.0)
+        self.assertEqual(items_by_key["calculation_area_source"].value, "Funda")
+        self.assertEqual(items_by_key["asking_price_per_m2"].value, 6250.0)
+        self.assertIn("low_confidence_match", items_by_key["bag_quality_flags"].value)
 
     def test_continues_when_one_enrichment_fails(self):
         engine = FailingStreetPriceEngine(public_data_service=StubPublicDataService())
@@ -91,7 +124,7 @@ class PropertyEnrichmentEngineTests(unittest.TestCase):
         result = engine.enrich(property_obj)
         items_by_key = {item.enrichment_key: item for item in result.items}
 
-        self.assertEqual(len(result.items), 25)
+        self.assertEqual(len(result.items), 39)
         self.assertFalse(items_by_key["street_m2_price_average"].success)
         self.assertIsNotNone(items_by_key["street_m2_price_average"].error_message)
         self.assertTrue(items_by_key["latest_woz_value"].success)
@@ -119,7 +152,7 @@ class PropertyEnrichmentEngineTests(unittest.TestCase):
         payload = result.to_dict()
 
         self.assertEqual(payload["property_id"], "p3")
-        self.assertEqual(len(payload["items"]), 25)
+        self.assertEqual(len(payload["items"]), 39)
         self.assertIsInstance(payload["items"], list)
 
 

@@ -306,9 +306,15 @@ class InvestmentIntelligenceEngine:
         return " ".join(pieces)
 
     def _property_price_per_m2(self, property_obj: Property) -> float | None:
+        asking_price_per_m2 = _safe_float(property_obj.asking_price_per_m2)
+        if asking_price_per_m2 is not None:
+            return round(asking_price_per_m2, 2)
         price_per_m2 = _safe_float(property_obj.price_per_m2)
         if price_per_m2 is not None:
             return round(price_per_m2, 2)
+        calculation_area_m2 = _safe_float(property_obj.calculation_area_m2)
+        if _safe_float(property_obj.asking_price) is not None and calculation_area_m2 not in (None, 0):
+            return round(float(property_obj.asking_price) / float(calculation_area_m2), 2)
         calculated = calculate_price_per_m2(property_obj.asking_price, property_obj.surface_m2, property_obj.asking_price_status)
         if calculated is not None:
             return calculated
@@ -325,7 +331,7 @@ class InvestmentIntelligenceEngine:
         return None
 
     def _property_building_year(self, property_obj: Property) -> int | None:
-        return property_obj.bag_building_year or property_obj.construction_year
+        return getattr(property_obj, "construction_year_bag", None) or property_obj.bag_building_year or property_obj.construction_year
 
     def _property_age(self, property_obj: Property) -> int | None:
         building_year = self._property_building_year(property_obj)

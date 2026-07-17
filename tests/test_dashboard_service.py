@@ -128,6 +128,8 @@ class DashboardServiceTests(unittest.TestCase):
         self.assertEqual(result.top_properties[0].woz_valuation_year, 2025)
         self.assertEqual(result.top_properties[0].asking_price_minus_woz_value, 50000.0)
         self.assertEqual(result.top_properties[0].asking_price_vs_woz_percentage, 12.5)
+        self.assertEqual(result.top_properties[0].calculation_area_m2, 110.0)
+        self.assertEqual(result.top_properties[0].asking_price_per_m2, None)
 
     def test_load_latest_dashboard_result_from_json_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -211,6 +213,7 @@ class DashboardServiceTests(unittest.TestCase):
             self.assertEqual(result.top_properties[0].woz_valuation_year, 2025)
             self.assertEqual(result.top_properties[0].asking_price_minus_woz_value, 20000.0)
             self.assertEqual(result.top_properties[0].asking_price_vs_woz_percentage, 4.17)
+            self.assertEqual(result.top_properties[0].calculation_area_m2, 95.0)
 
 
 if __name__ == "__main__":

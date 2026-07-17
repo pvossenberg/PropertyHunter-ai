@@ -190,7 +190,7 @@ class OpportunityIntelligenceEngine:
         combined_text = f"{raw_text} {description}".strip()
 
         plot_size = _safe_float(property_obj.plot_size_m2)
-        living_area = _safe_float(property_obj.surface_m2)
+        living_area = _safe_float(property_obj.calculation_area_m2) or _safe_float(property_obj.surface_m2)
         remaining_outdoor_space_m2 = None
         outdoor_space_ratio = None
         if plot_size is not None and plot_size > 0 and living_area is not None and living_area > 0:
@@ -256,7 +256,7 @@ class OpportunityIntelligenceEngine:
             price_per_m2=price_per_m2,
             benchmark_price_per_m2=benchmark_price_per_m2,
             price_per_m2_delta_pct=price_per_m2_delta_pct,
-            construction_year=_safe_int(property_obj.construction_year),
+            construction_year=_safe_int(getattr(property_obj, "construction_year_bag", None) or property_obj.bag_building_year or property_obj.construction_year),
             energy_label=_normalize_text(property_obj.energy_label),
             property_type=property_type,
             raw_text=raw_text,

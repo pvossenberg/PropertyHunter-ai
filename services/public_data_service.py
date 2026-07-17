@@ -40,6 +40,31 @@ def _safe_int(value: Any) -> int | None:
         return None
 
 
+def _normalize_postcode(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    match = re.search(r"(\d{4})\s*([A-Za-z]{2})", value)
+    if not match:
+        return None
+    return f"{match.group(1)}{match.group(2).upper()}"
+
+
+def _normalize_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.strip().lower().split())
+
+
+def _normalize_identifier(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    digits = "".join(character for character in text if character.isdigit())
+    if digits:
+        return digits.lstrip("0") or "0"
+    return text.lower()
+
+
 def _parse_rd_point(value: str | None) -> dict[str, float] | None:
     if not isinstance(value, str) or "POINT(" not in value:
         return None
@@ -97,32 +122,56 @@ class DutchPublicDataService:
 
         def _load() -> dict[str, Any]:
             woz_snapshot = self._fetch_woz_snapshot_sync(property_obj)
-            nummeraanduiding_id = woz_snapshot.get("bag_numberaanduiding_id")
-            vbo_id = woz_snapshot.get("bag_id") or woz_snapshot.get("bag_verblijfsobject_id")
-            if not nummeraanduiding_id and not vbo_id:
-                address_doc = self._resolve_address(property_obj)
-                nummeraanduiding_id = address_doc.get("identificatie")
-                vbo_id = address_doc.get("adresseerbaarobjectid") or address_doc.get("identificatie")
+            address_docs = self._resolve_address_docs(property_obj)
+            selected_match = self._select_best_bag_match(property_obj, address_docs, woz_snapshot)
+            address_doc = selected_match.get("address_doc") or {}
+            official = selected_match.get("official") or {}
+            nummeraanduiding_id = selected_match.get("nummeraanduiding_id")
+            vbo_id = selected_match.get("vbo_id")
 
-            official = self._lookup_bag_verblijfsobject(vbo_id) if vbo_id else {}
-            address_doc = self._resolve_address(property_obj)
+            usage_purpose = self._normalize_usage(official.get("gebruiksdoel"))
+            confidence_score = self._bag_confidence_score(
+                property_obj=property_obj,
+                address_doc=address_doc,
+                official=official,
+                all_docs=address_docs,
+            )
+            quality_flags = self._bag_quality_flags(
+                address_doc=address_doc,
+                official=official,
+                all_docs=address_docs,
+                confidence_score=confidence_score,
+            )
 
             result = {
+                "bag_address_id": str(nummeraanduiding_id or "") or None,
+                "bag_verblijfsobject_id": str(vbo_id or "") or None,
                 "bag_id": str(vbo_id) if vbo_id else None,
                 "bag_nummeraanduiding_id": str(nummeraanduiding_id) if nummeraanduiding_id else None,
                 "bag_pand_id": str(official.get("pandidentificatie") or woz_snapshot.get("bag_pand_id") or "") or None,
                 "bag_building_year": _safe_int(official.get("bouwjaar") or woz_snapshot.get("bag_building_year")),
-                "bag_usage_purpose": self._normalize_usage(official.get("gebruiksdoel")),
+                "construction_year_bag": _safe_int(official.get("bouwjaar") or woz_snapshot.get("bag_building_year")),
+                "bag_usage_purpose": usage_purpose,
+                "usage_purpose": usage_purpose,
+                "status": str(official.get("status") or official.get("pandstatus") or "").strip() or None,
                 "bag_official_floor_area_m2": _safe_float(official.get("oppervlakte") or woz_snapshot.get("bag_official_floor_area_m2")),
+                "official_floor_area_m2": _safe_float(official.get("oppervlakte") or woz_snapshot.get("bag_official_floor_area_m2")),
                 "bag_coordinates_rd": _parse_rd_point(address_doc.get("centroide_rd")),
                 "bag_coordinates_ll": _parse_ll_point(address_doc.get("centroide_ll")),
+                "coordinates": {
+                    "rd": _parse_rd_point(address_doc.get("centroide_rd")),
+                    "ll": _parse_ll_point(address_doc.get("centroide_ll")),
+                },
                 "bag_postcode": address_doc.get("postcode") or official.get("postcode") or property_obj.postal_code,
                 "bag_municipality": address_doc.get("gemeentenaam") or property_obj.municipality or property_obj.city,
                 "source": "PDOK BAG WFS + PDOK Locatieserver",
                 "retrieval_date": datetime.now(timezone.utc).isoformat(),
-                "confidence_score": 95 if official else 65,
+                "confidence_score": confidence_score,
+                "quality_flags": quality_flags,
                 "raw_payload": {
                     "address": address_doc,
+                    "address_candidates": address_docs,
+                    "selected_match": selected_match,
                     "bag_verblijfsobject": official,
                     "woz_snapshot": woz_snapshot,
                 },
@@ -259,6 +308,7 @@ class DutchPublicDataService:
                 "bouwjaar": properties.get("bouwjaar"),
                 "pandidentificatie": properties.get("pandidentificatie"),
                 "pandstatus": properties.get("pandstatus"),
+                "status": properties.get("status"),
                 "postcode": properties.get("postcode"),
                 "openbare_ruimte": properties.get("openbare_ruimte"),
                 "huisnummer": properties.get("huisnummer"),
@@ -271,6 +321,91 @@ class DutchPublicDataService:
         return self._cached(cache_key, _load)
 
     def _resolve_address(self, property_obj: Property) -> dict[str, Any]:
+        docs = self._resolve_address_docs(property_obj)
+        return self._select_best_address_doc(property_obj, docs)
+
+    def _select_best_bag_match(
+        self,
+        property_obj: Property,
+        docs: list[dict[str, Any]],
+        woz_snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
+        expected = self._parse_address_components(property_obj)
+        preferred_nummeraanduiding_id = str(woz_snapshot.get("bag_numberaanduiding_id") or "").strip()
+        preferred_vbo_id = str(woz_snapshot.get("bag_id") or woz_snapshot.get("bag_verblijfsobject_id") or "").strip()
+
+        candidates: list[dict[str, Any]] = []
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+
+            doc_nummeraanduiding_id = str(
+                doc.get("nummeraanduiding_id")
+                or doc.get("nummeraanduidingid")
+                or doc.get("identificatie")
+                or ""
+            ).strip()
+            doc_vbo_id = str(
+                doc.get("adresseerbaarobjectid")
+                or doc.get("adresseerbaarobject_id")
+                or doc.get("identificatie")
+                or ""
+            ).strip()
+            nummeraanduiding_id = str(
+                doc_nummeraanduiding_id
+                or preferred_nummeraanduiding_id
+                or ""
+            ).strip() or None
+            vbo_id = str(
+                doc_vbo_id
+                or preferred_vbo_id
+                or ""
+            ).strip() or None
+            official = self._lookup_bag_verblijfsobject(vbo_id) if vbo_id else {}
+            candidates.append(
+                {
+                    "address_doc": doc,
+                    "nummeraanduiding_id": nummeraanduiding_id,
+                    "vbo_id": vbo_id,
+                    "official": official,
+                    "score": self._bag_candidate_score(
+                        property_obj=property_obj,
+                        expected=expected,
+                        doc=doc,
+                        official=official,
+                        preferred_nummeraanduiding_id=preferred_nummeraanduiding_id,
+                        preferred_vbo_id=preferred_vbo_id,
+                    ),
+                }
+            )
+
+        if candidates:
+            return max(candidates, key=lambda item: item.get("score") or 0)
+
+        fallback_doc = self._select_best_address_doc(property_obj, docs)
+        nummeraanduiding_id = str(
+            fallback_doc.get("nummeraanduiding_id")
+            or fallback_doc.get("nummeraanduidingid")
+            or preferred_nummeraanduiding_id
+            or fallback_doc.get("identificatie")
+            or ""
+        ).strip() or None
+        vbo_id = str(
+            fallback_doc.get("adresseerbaarobjectid")
+            or fallback_doc.get("adresseerbaarobject_id")
+            or preferred_vbo_id
+            or fallback_doc.get("identificatie")
+            or ""
+        ).strip() or None
+        return {
+            "address_doc": fallback_doc,
+            "nummeraanduiding_id": nummeraanduiding_id,
+            "vbo_id": vbo_id,
+            "official": self._lookup_bag_verblijfsobject(vbo_id) if vbo_id else {},
+            "score": 0,
+        }
+
+    def _resolve_address_docs(self, property_obj: Property) -> list[dict[str, Any]]:
         cache_key = f"loc:{self._cache_key_suffix(property_obj)}"
 
         def _load() -> dict[str, Any]:
@@ -278,15 +413,18 @@ class DutchPublicDataService:
             query = " ".join(part for part in query_parts if isinstance(part, str) and part.strip())
             response = self._request_json("GET", PDOK_LOCATIESERVER_FREE_URL, params={"q": query})
             docs = (response.get("response") or {}).get("docs") or []
-            address_doc = self._select_best_address_doc(property_obj, docs)
-            return dict(address_doc) if isinstance(address_doc, dict) else {}
+            normalized_docs = [dict(doc) for doc in docs if isinstance(doc, dict)]
+            return {"docs": normalized_docs}
 
-        return self._cached(cache_key, _load)
+        payload = self._cached(cache_key, _load)
+        return payload.get("docs") if isinstance(payload.get("docs"), list) else []
 
     def _select_best_address_doc(self, property_obj: Property, docs: list[dict[str, Any]]) -> dict[str, Any]:
         if not docs:
             return {}
         expected = self._parse_address_components(property_obj)
+        expected_city = _normalize_text(property_obj.municipality or property_obj.city)
+        expected_street = _normalize_text(expected.get("street_name") or "")
 
         def score(doc: dict[str, Any]) -> tuple[int, float]:
             points = 0
@@ -310,7 +448,16 @@ class DutchPublicDataService:
                 if str(doc.get("huisnummertoevoeging") or "").strip().upper() == expected["house_number_addition"]:
                     points += 8
 
-            if str(property_obj.city or "").strip() and str(doc.get("woonplaatsnaam") or "").strip().lower() == str(property_obj.city or "").strip().lower():
+            if expected_street:
+                doc_street = _normalize_text(doc.get("straatnaam") or doc.get("openbareruimtenaam"))
+                if doc_street and doc_street == expected_street:
+                    points += 14
+
+            doc_purpose = self._normalize_usage(doc.get("gebruiksdoel") or doc.get("gebruiksdoelen"))
+            if doc_purpose and "woon" in doc_purpose.lower():
+                points += 8
+
+            if expected_city and _normalize_text(doc.get("woonplaatsnaam")) == expected_city:
                 points += 8
 
             relevance = _safe_float(doc.get("score")) or 0.0
@@ -324,15 +471,12 @@ class DutchPublicDataService:
         postal_code_text = str(property_obj.postal_code or "")
 
         postcode_candidate = postal_code_text or address
-        normalized_postcode = None
-        postcode_match = re.search(r"(\d{4})\s*([A-Za-z]{2})", postcode_candidate)
-        if postcode_match:
-            normalized_postcode = f"{postcode_match.group(1)}{postcode_match.group(2).upper()}"
+        normalized_postcode = _normalize_postcode(postcode_candidate)
 
         house_number = None
         house_letter = ""
         house_number_addition = ""
-        house_match = re.search(r"\b(\d{1,5})(?:\s*[-/]?\s*([A-Za-z]))?(?:\s*[-/]?\s*([A-Za-z0-9]{1,4}))?\b", address)
+        house_match = re.search(r"\b(\d{1,5})(?:\s*[-/]?\s*([A-Za-z]))?(?:\s*[-/]?\s*([A-Za-z0-9]{1,6}))?\b", address)
         if house_match:
             house_number = _safe_int(house_match.group(1))
             house_letter = str(house_match.group(2) or "").strip().upper()
@@ -340,12 +484,163 @@ class DutchPublicDataService:
             if house_number_addition and house_number_addition == house_letter:
                 house_number_addition = ""
 
+        street_name = ""
+        if house_match:
+            street_name = address[: house_match.start()].strip(" ,")
+        if not street_name and isinstance(property_obj.address, str):
+            street_name = property_obj.address.strip()
+
         return {
             "postcode": normalized_postcode,
             "house_number": house_number,
             "house_letter": house_letter,
             "house_number_addition": house_number_addition,
+            "street_name": street_name,
         }
+
+    def _bag_candidate_score(
+        self,
+        *,
+        property_obj: Property,
+        expected: dict[str, Any],
+        doc: dict[str, Any],
+        official: dict[str, Any],
+        preferred_nummeraanduiding_id: str,
+        preferred_vbo_id: str,
+    ) -> int:
+        score = 0
+
+        if str(doc.get("type") or "").strip().lower() == "adres":
+            score += 35
+
+        expected_postcode = expected.get("postcode")
+        doc_postcode = _normalize_postcode(doc.get("postcode"))
+        if expected_postcode and doc_postcode == expected_postcode:
+            score += 20
+
+        expected_number = expected.get("house_number")
+        if expected_number is not None and _safe_int(doc.get("huisnummer")) == expected_number:
+            score += 15
+
+        expected_letter = str(expected.get("house_letter") or "").upper()
+        doc_letter = str(doc.get("huisletter") or official.get("huisletter") or "").strip().upper()
+        if expected_letter:
+            if doc_letter == expected_letter:
+                score += 14
+            elif doc_letter:
+                score -= 10
+
+        expected_addition = str(expected.get("house_number_addition") or "").upper()
+        doc_addition = str(doc.get("huisnummertoevoeging") or official.get("toevoeging") or "").strip().upper()
+        if expected_addition:
+            if doc_addition == expected_addition:
+                score += 14
+            elif doc_addition:
+                score -= 10
+
+        expected_street = _normalize_text(expected.get("street_name"))
+        doc_street = _normalize_text(doc.get("straatnaam") or doc.get("openbareruimtenaam") or official.get("openbare_ruimte"))
+        if expected_street and doc_street == expected_street:
+            score += 10
+
+        expected_city = _normalize_text(property_obj.municipality or property_obj.city)
+        doc_city = _normalize_text(doc.get("woonplaatsnaam") or official.get("woonplaats"))
+        if expected_city and doc_city == expected_city:
+            score += 8
+
+        usage = self._normalize_usage(official.get("gebruiksdoel") or doc.get("gebruiksdoel") or doc.get("gebruiksdoelen"))
+        if usage:
+            if "woon" in usage.lower():
+                score += 22
+            else:
+                score -= 12
+
+        area = _safe_float(official.get("oppervlakte"))
+        if area not in (None, 0):
+            score += 8
+
+        nummeraanduiding_id = str(doc.get("nummeraanduiding_id") or doc.get("nummeraanduidingid") or "").strip()
+        vbo_id = str(doc.get("adresseerbaarobjectid") or doc.get("adresseerbaarobject_id") or "").strip()
+        if preferred_nummeraanduiding_id and _normalize_identifier(nummeraanduiding_id) == _normalize_identifier(preferred_nummeraanduiding_id):
+            score += 10
+        if preferred_vbo_id and _normalize_identifier(vbo_id) == _normalize_identifier(preferred_vbo_id):
+            score += 12
+
+        relevance = _safe_float(doc.get("score"))
+        if relevance is not None:
+            score += int(round(relevance))
+
+        return score
+
+    def _bag_confidence_score(
+        self,
+        *,
+        property_obj: Property,
+        address_doc: dict[str, Any],
+        official: dict[str, Any],
+        all_docs: list[dict[str, Any]],
+    ) -> int:
+        score = 0
+        expected = self._parse_address_components(property_obj)
+
+        if address_doc:
+            score += 30
+
+        if official:
+            score += 30
+
+        expected_postcode = expected.get("postcode")
+        if expected_postcode:
+            doc_postcode = _normalize_postcode(address_doc.get("postcode"))
+            if doc_postcode == expected_postcode:
+                score += 15
+
+        expected_number = expected.get("house_number")
+        if expected_number is not None and _safe_int(address_doc.get("huisnummer")) == expected_number:
+            score += 10
+
+        expected_letter = str(expected.get("house_letter") or "").upper()
+        if expected_letter and str(address_doc.get("huisletter") or official.get("huisletter") or "").strip().upper() == expected_letter:
+            score += 5
+
+        expected_addition = str(expected.get("house_number_addition") or "").upper()
+        if expected_addition and str(address_doc.get("huisnummertoevoeging") or official.get("toevoeging") or "").strip().upper() == expected_addition:
+            score += 5
+
+        usage = self._normalize_usage(official.get("gebruiksdoel"))
+        if usage and "woon" in usage.lower():
+            score += 10
+
+        if len(all_docs) > 1:
+            score -= 5
+
+        return max(0, min(100, int(score)))
+
+    def _bag_quality_flags(
+        self,
+        *,
+        address_doc: dict[str, Any],
+        official: dict[str, Any],
+        all_docs: list[dict[str, Any]],
+        confidence_score: int,
+    ) -> list[str]:
+        flags: list[str] = []
+        if not address_doc:
+            flags.append("bag_match_not_found")
+        if len(all_docs) > 1:
+            flags.append("multiple_possible_bag_matches")
+
+        usage = self._normalize_usage(official.get("gebruiksdoel"))
+        if usage and "woon" not in usage.lower():
+            flags.append("non_residential_usage_purpose")
+
+        area = _safe_float(official.get("oppervlakte"))
+        if area in (None, 0):
+            flags.append("missing_official_area")
+
+        if confidence_score < 70:
+            flags.append("low_confidence_match")
+        return flags
 
     def _nummeraanduiding_candidates(self, address_doc: dict[str, Any]) -> list[str]:
         if not isinstance(address_doc, dict):

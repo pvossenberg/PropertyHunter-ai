@@ -2,6 +2,7 @@ import unittest
 from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import json
 
 from ai.analyzer import PROPERTY_ANALYSIS_SCHEMA, REQUIRED_KEYS, _infer_asking_price_fields, analyze_property, _validate_analysis_payload
 from app import (
@@ -10,6 +11,7 @@ from app import (
     _format_number,
     _investment_intelligence_rating,
     _label_score,
+    _run_funda_scan_from_ui,
     _run_source_scan,
     _render_analysis_result,
 )
@@ -105,6 +107,293 @@ class PropertyHunterTests(unittest.TestCase):
         self.assertGreaterEqual(result["average_import_time_seconds"], 0.0)
         self.assertEqual(len(database_service.saved_payloads), 1)
         self.assertTrue(result["output_path"].endswith(".json"))
+
+    def test_run_source_scan_dry_run_enriches_without_database_writes(self):
+        class DisabledDatabaseService:
+            def __init__(self):
+                self.is_enabled = False
+                self.write_attempts = 0
+
+            def upsert_property(self, property_payload):
+                self.write_attempts += 1
+                raise AssertionError("dry-run should not write properties")
+
+        class FakeAdapter:
+            source_name = "funda.nl"
+            default_start_url = "https://www.funda.nl/zoeken/koop"
+
+            def validate_configuration(self, configuration):
+                return True, []
+
+            def load_and_normalize_listings(self, configuration):
+                listing = NormalizedListing(
+                    source_name=self.source_name,
+                    external_listing_id="f-1",
+                    source_url="https://www.funda.nl/detail/koop/breda/appartement-1/11111111/",
+                    title="Test listing",
+                    address="Voorbeeldstraat 1 Breda",
+                    city="Breda",
+                    asking_price=450000.0,
+                    surface_m2=90.0,
+                    listing_status="active",
+                    raw_payload={
+                        "source_url": "https://www.funda.nl/detail/koop/breda/appartement-1/11111111/",
+                        "address": "Voorbeeldstraat 1 Breda",
+                        "city": "Breda",
+                        "surface_m2": 90.0,
+                    },
+                )
+                return [SourceRecordResult(record_index=1, success=True, listing=listing, payload=dict(listing.raw_payload))]
+
+            def get_last_fetch_stats(self):
+                return {"listings_found": 1, "listings_imported": 1, "duplicates_skipped": 0, "failed_listings": 0}
+
+            def to_property_model(self, payload):
+                return Property(
+                    source_url=payload["source_url"],
+                    title="Test listing",
+                    address=payload["address"],
+                    city=payload["city"],
+                    asking_price=450000.0,
+                    surface_m2=90.0,
+                    listing_status="active",
+                )
+
+        class FakeRegistry:
+            def __init__(self, adapter):
+                self.adapter = adapter
+
+            def resolve(self, source_name):
+                return self.adapter if source_name == "funda" else None
+
+        class FakeOrchestrator:
+            def __init__(self, adapter):
+                self.source_registry = FakeRegistry(adapter)
+                self.enrichment_calls = 0
+
+            def _enrich_listing_with_public_data(self, *, listing_row, source_name, persist=True):
+                self.enrichment_calls += 1
+                if persist:
+                    raise AssertionError("dry-run enrichment must not persist")
+                enriched = dict(listing_row)
+                enriched["raw_payload"] = {
+                    **(listing_row.get("raw_payload") or {}),
+                    "bag_verblijfsobject_id": "0758010000017236",
+                    "bag_official_floor_area_m2": 88.0,
+                    "funda_living_area_m2": 90.0,
+                    "calculation_area_m2": 88.0,
+                    "calculation_area_source": "BAG",
+                    "asking_price_per_m2": 5113.64,
+                    "woz_value_per_m2": 4545.45,
+                    "living_area_difference_m2": 2.0,
+                    "living_area_difference_percentage": 2.27,
+                    "bag_building_year": 1999,
+                    "bag_usage_purpose": "woonfunctie",
+                    "bag_confidence_score": 93,
+                    "latest_woz_value": 400000.0,
+                    "woz_valuation_year": 2025,
+                    "bag_quality_flags": [],
+                }
+                return enriched, []
+
+        database_service = DisabledDatabaseService()
+        orchestrator = FakeOrchestrator(FakeAdapter())
+
+        with TemporaryDirectory() as temp_dir:
+            result = _run_source_scan(
+                "funda",
+                orchestrator=orchestrator,
+                database_service=database_service,
+                output_dir=Path(temp_dir),
+                max_pages=1,
+                timeout_seconds=1.0,
+            )
+            payload = json.loads(Path(result["output_path"]).read_text(encoding="utf-8"))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(orchestrator.enrichment_calls, 1)
+        self.assertEqual(database_service.write_attempts, 0)
+        property_row = payload["properties"][0]["property"]
+        self.assertEqual(property_row["bag_verblijfsobject_id"], "0758010000017236")
+        self.assertEqual(property_row["bag_official_floor_area_m2"], 88.0)
+        self.assertEqual(property_row["latest_woz_value"], 400000.0)
+        self.assertEqual(property_row["calculation_area_source"], "BAG")
+        self.assertEqual(property_row["asking_price_per_m2"], 5113.64)
+
+    def test_run_source_scan_dry_run_continues_when_enrichment_fails(self):
+        class DisabledDatabaseService:
+            is_enabled = False
+
+        class FakeAdapter:
+            source_name = "funda.nl"
+            default_start_url = "https://www.funda.nl/zoeken/koop"
+
+            def validate_configuration(self, configuration):
+                return True, []
+
+            def load_and_normalize_listings(self, configuration):
+                listing = NormalizedListing(
+                    source_name=self.source_name,
+                    external_listing_id="f-1",
+                    source_url="https://www.funda.nl/detail/koop/breda/appartement-1/11111111/",
+                    title="Test listing",
+                    address="Voorbeeldstraat 1 Breda",
+                    city="Breda",
+                    asking_price=450000.0,
+                    surface_m2=90.0,
+                    listing_status="active",
+                    raw_payload={"source_url": "https://www.funda.nl/detail/koop/breda/appartement-1/11111111/"},
+                )
+                return [SourceRecordResult(record_index=1, success=True, listing=listing, payload=dict(listing.raw_payload))]
+
+            def get_last_fetch_stats(self):
+                return {"listings_found": 1, "listings_imported": 1, "duplicates_skipped": 0, "failed_listings": 0}
+
+            def to_property_model(self, payload):
+                return Property(source_url=payload["source_url"], city="Breda", asking_price=450000.0, surface_m2=90.0, listing_status="active")
+
+        class FakeRegistry:
+            def __init__(self, adapter):
+                self.adapter = adapter
+
+            def resolve(self, source_name):
+                return self.adapter if source_name == "funda" else None
+
+        class FakeOrchestrator:
+            def __init__(self, adapter):
+                self.source_registry = FakeRegistry(adapter)
+
+            def _enrich_listing_with_public_data(self, *, listing_row, source_name, persist=True):
+                raise RuntimeError("boom")
+
+        with TemporaryDirectory() as temp_dir:
+            result = _run_source_scan(
+                "funda",
+                orchestrator=FakeOrchestrator(FakeAdapter()),
+                database_service=DisabledDatabaseService(),
+                output_dir=Path(temp_dir),
+                max_pages=1,
+                timeout_seconds=1.0,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["listings_imported"], 1)
+        self.assertTrue(any("dry-run BAG/WOZ enrichment failed" in warning for warning in (result.get("warnings") or [])))
+
+    def test_funda_dry_run_returns_scored_rows_from_enriched_scan_output(self):
+        import app as app_module
+
+        class FakeDatabaseServiceCtor:
+            def __init__(self):
+                self.is_enabled = False
+
+        class FakeAdapter:
+            source_name = "funda.nl"
+            default_start_url = "https://www.funda.nl/zoeken/koop"
+
+            def validate_configuration(self, configuration):
+                return True, []
+
+            def load_and_normalize_listings(self, configuration):
+                listing = NormalizedListing(
+                    source_name=self.source_name,
+                    external_listing_id="f-1",
+                    source_url="https://www.funda.nl/detail/koop/breda/appartement-1/11111111/",
+                    title="Test listing",
+                    address="Voorbeeldstraat 1 Breda",
+                    city="Breda",
+                    asking_price=450000.0,
+                    surface_m2=90.0,
+                    listing_status="active",
+                    raw_payload={
+                        "source_url": "https://www.funda.nl/detail/koop/breda/appartement-1/11111111/",
+                        "address": "Voorbeeldstraat 1 Breda",
+                        "city": "Breda",
+                        "surface_m2": 90.0,
+                        "bedrooms": 3,
+                        "energy_label": "A",
+                        "construction_year": 1999,
+                    },
+                )
+                return [SourceRecordResult(record_index=1, success=True, listing=listing, payload=dict(listing.raw_payload))]
+
+            def get_last_fetch_stats(self):
+                return {"listings_found": 1, "listings_imported": 1, "duplicates_skipped": 0, "failed_listings": 0}
+
+            def to_property_model(self, payload):
+                return Property(
+                    source_url=payload["source_url"],
+                    title="Test listing",
+                    address=payload["address"],
+                    city=payload["city"],
+                    asking_price=450000.0,
+                    surface_m2=90.0,
+                    bedrooms=3,
+                    energy_label="A",
+                    construction_year=1999,
+                    listing_status="active",
+                )
+
+        class FakeRegistry:
+            def __init__(self, adapter):
+                self.adapter = adapter
+
+            def resolve(self, source_name):
+                return self.adapter if source_name == "funda" else None
+
+        class FakeOrchestrator:
+            def __init__(self, adapter):
+                self.source_registry = FakeRegistry(adapter)
+
+            def _enrich_listing_with_public_data(self, *, listing_row, source_name, persist=True):
+                enriched = dict(listing_row)
+                enriched["raw_payload"] = {
+                    **(listing_row.get("raw_payload") or {}),
+                    "bag_verblijfsobject_id": "0758010000017236",
+                    "bag_official_floor_area_m2": 88.0,
+                    "funda_living_area_m2": 90.0,
+                    "calculation_area_m2": 88.0,
+                    "calculation_area_source": "BAG",
+                    "asking_price_per_m2": 5113.64,
+                    "woz_value_per_m2": 4545.45,
+                    "living_area_difference_m2": 2.0,
+                    "living_area_difference_percentage": 2.27,
+                    "bag_building_year": 1999,
+                    "bag_usage_purpose": "woonfunctie",
+                    "bag_confidence_score": 93,
+                    "latest_woz_value": 400000.0,
+                    "woz_valuation_year": 2025,
+                    "bag_quality_flags": [],
+                }
+                return enriched, []
+
+        original_orchestrator = app_module.DEAL_FINDER_ORCHESTRATOR
+        original_database_service_cls = app_module.DatabaseService
+        try:
+            app_module.DEAL_FINDER_ORCHESTRATOR = FakeOrchestrator(FakeAdapter())
+            app_module.DatabaseService = FakeDatabaseServiceCtor
+            result = _run_funda_scan_from_ui(
+                cities=["Breda"],
+                min_price=0,
+                max_price=0,
+                min_living_area=0,
+                max_pages_per_city=1,
+                dry_run=True,
+            )
+        finally:
+            app_module.DEAL_FINDER_ORCHESTRATOR = original_orchestrator
+            app_module.DatabaseService = original_database_service_cls
+
+        self.assertEqual(result["mode"], "dry-run")
+        self.assertEqual(result["listings_imported"], 1)
+        self.assertEqual(len(result["top_rows"]), 1)
+        top_row = result["top_rows"][0]
+        self.assertEqual(top_row["bag_oppervlak"], 88.0)
+        self.assertEqual(top_row["bron_rekenoppervlak"], "BAG")
+        self.assertEqual(top_row["woz_per_m2"], 4545.45)
+        self.assertEqual(top_row["bag_confidence_score"], 93)
+        self.assertIsNotNone(top_row.get("investment_score"))
+        self.assertIsNotNone(top_row.get("opportunity_score"))
 
     def test_fetch_page_text_rejects_non_http_urls(self):
         with self.assertRaises(ValueError):
