@@ -1172,6 +1172,14 @@ def _build_propertyhunter_rows(candidates: list[dict[str, Any]]) -> list[dict[st
         if not listing_id:
             continue
 
+        permits_history_raw = _listing_value(listing, "permits_last_10_years")
+        active_permits_raw = _listing_value(listing, "active_permits")
+        permit_history_count = 0
+        if isinstance(permits_history_raw, list):
+            permit_history_count += len(permits_history_raw)
+        if isinstance(active_permits_raw, list):
+            permit_history_count += len(active_permits_raw)
+
         rows.append(
             {
                 "listing_id": listing_id,
@@ -1201,6 +1209,7 @@ def _build_propertyhunter_rows(candidates: list[dict[str, Any]]) -> list[dict[st
                 "bag_quality_flags": _listing_value(listing, "bag_quality_flags") or [],
                 "price_reduction_count": _safe_score(_listing_value(listing, "price_reduction_count")),
                 "days_on_market": _safe_score(_listing_value(listing, "days_on_market")),
+                "permit_history_count": permit_history_count,
                 "listing_history": _propertyhunter_listing_history_text(listing),
                 "listed_since": str(_listing_value(listing, "listed_since") or ""),
                 "source_timestamp": str(_listing_value(listing, "source_timestamp", "timestamp") or ""),
@@ -1383,6 +1392,14 @@ def _build_rows_from_scan_properties(properties: list[dict[str, Any]]) -> list[d
                     return raw_payload.get(key)
             return None
 
+        permits_history_raw = value("permits_last_10_years")
+        active_permits_raw = value("active_permits")
+        permit_history_count = 0
+        if isinstance(permits_history_raw, list):
+            permit_history_count += len(permits_history_raw)
+        if isinstance(active_permits_raw, list):
+            permit_history_count += len(active_permits_raw)
+
         rows.append(
             {
                 "listing_id": str(value("listing_id") or "").strip(),
@@ -1413,6 +1430,7 @@ def _build_rows_from_scan_properties(properties: list[dict[str, Any]]) -> list[d
                 "bag_bouwjaar": _safe_score(value("bag_building_year")),
                 "bag_confidence_score": _safe_score(value("bag_confidence_score", "confidence_score")),
                 "bag_quality_flags": value("bag_quality_flags") or [],
+                "permit_history_count": permit_history_count,
                 "investment_score": None,
                 "opportunity_score": None,
                 "bron": _source_display_name(value("source_name", "source"), value("source_url")),
@@ -1474,6 +1492,54 @@ def _compute_row_price_per_m2(row: dict[str, Any]) -> float | None:
     if price is None or living_area in (None, 0):
         return None
     return round(price / living_area, 2)
+
+
+def _energy_label_score(label: str) -> float:
+    normalized = str(label or "").strip().upper()
+    mapping = {
+        "A++++": 100.0,
+        "A+++": 98.0,
+        "A++": 96.0,
+        "A+": 94.0,
+        "A": 92.0,
+        "B": 82.0,
+        "C": 70.0,
+        "D": 55.0,
+        "E": 40.0,
+        "F": 25.0,
+        "G": 10.0,
+    }
+    if normalized in mapping:
+        return mapping[normalized]
+    if normalized.startswith("A"):
+        return 92.0
+    return 50.0
+
+
+def _building_size_score(surface_m2: float | None) -> float:
+    if surface_m2 is None:
+        return 0.0
+    # 60 m² -> 0, 180 m² and above -> 100
+    normalized = (float(surface_m2) - 60.0) / 120.0
+    return max(0.0, min(100.0, normalized * 100.0))
+
+
+def _days_on_market_score(days_on_market: int | None) -> float:
+    if days_on_market is None:
+        return 0.0
+    return max(0.0, min(100.0, (float(days_on_market) / 180.0) * 100.0))
+
+
+def _price_reduction_score(price_reduction_count: int | None) -> float:
+    if price_reduction_count is None:
+        return 0.0
+    return max(0.0, min(100.0, (float(price_reduction_count) / 4.0) * 100.0))
+
+
+def _permit_history_score(permit_history_count: int | None) -> float:
+    if permit_history_count is None:
+        return 0.0
+    return max(0.0, min(100.0, (float(permit_history_count) / 6.0) * 100.0))
 
 
 def _compute_market_discount_ratio(*, asking_price_per_m2: float | None, neighborhood_price_per_m2: float | None) -> float | None:
@@ -1546,6 +1612,7 @@ def _score_rows_with_opportunity_intelligence(rows: list[dict[str, Any]]) -> lis
             row_bedrooms = _safe_score(row.get("slaapkamers"))
             row_days = _safe_score(row.get("days_on_market"))
             row_reductions = _safe_score(row.get("price_reduction_count")) or 0
+            permit_history_count = _safe_score(row.get("permit_history_count"))
             row_ppm2 = _compute_row_price_per_m2(row)
             row["price_per_m2"] = row_ppm2
             row["asking_price_per_m2"] = row_ppm2
@@ -1593,29 +1660,6 @@ def _score_rows_with_opportunity_intelligence(rows: list[dict[str, Any]]) -> lis
                 # Lower price per m² is better, so invert percentile for opportunity component.
                 price_per_m2_percentile = max(0.0, min(100.0, 100.0 - percentile))
             row["price_per_m2_percentile"] = price_per_m2_percentile
-
-            opportunity_score = _safe_score(row.get("opportunity_score"))
-            if opportunity_score is None:
-                percentile_component = 0.0
-                if price_per_m2_percentile is not None:
-                    percentile_component = (price_per_m2_percentile / 100.0) * 20.0
-
-                completeness_fields = [row_area, row_energy if row_energy and row_energy != "ONBEKEND" else None, row_year, row_plot, row_bedrooms, row_ppm2]
-                completeness_count = sum(1 for value in completeness_fields if value not in (None, "", 0))
-                completeness_component = (completeness_count / len(completeness_fields)) * 15.0
-
-                upside_component = 0.0
-                if int(_safe_score(row.get("price_reduction_count")) or 0) > 0:
-                    upside_component += 5.0
-                if row_year is not None and row_year < 1990:
-                    upside_component += 3.0
-                if row_energy in {"D", "E", "F", "G"}:
-                    upside_component += 2.0
-                upside_component = max(0.0, min(10.0, upside_component))
-
-                calculated = (float(investment_score or 0) * 0.55) + percentile_component + completeness_component + upside_component
-                opportunity_score = max(0, min(100, int(round(calculated))))
-            row["opportunity_score"] = max(0, min(100, int(opportunity_score))) if opportunity_score is not None else None
 
             diff_pct = _safe_number(row.get("difference_vs_city_avg_pct"))
 
@@ -1712,6 +1756,32 @@ def _score_rows_with_opportunity_intelligence(rows: list[dict[str, Any]]) -> lis
             row["vertical_extension_potential"] = vertical_score
             row["rental_potential"] = rental_score
             row["renovation_potential"] = renovation_score
+
+            weighted_components = {
+                "market_discount": float(row.get("market_discount_score") or 0.0),
+                "days_on_market": _days_on_market_score(row_days),
+                "price_reductions": _price_reduction_score(row_reductions),
+                "building_size": _building_size_score(row_area),
+                "split_potential": float(split_score),
+                "top_up_potential": float(vertical_score),
+                "energy_label": _energy_label_score(row_energy),
+                "permit_history": _permit_history_score(permit_history_count),
+                "investment_score": float(investment_score or 0.0),
+            }
+            component_weights = {
+                "market_discount": 0.20,
+                "days_on_market": 0.10,
+                "price_reductions": 0.10,
+                "building_size": 0.10,
+                "split_potential": 0.15,
+                "top_up_potential": 0.10,
+                "energy_label": 0.10,
+                "permit_history": 0.05,
+                "investment_score": 0.10,
+            }
+            weighted_total = sum(weighted_components[key] * component_weights[key] for key in component_weights)
+            row["opportunity_components"] = {key: round(value, 2) for key, value in weighted_components.items()}
+            row["opportunity_score"] = max(0, min(100, int(round(weighted_total))))
 
             overall_score = int(
                 round(
@@ -2093,13 +2163,7 @@ def _render_propertyhunter_interface_page():
         and (_safe_score(row.get("opportunity_score")) is not None and _safe_score(row.get("opportunity_score")) >= int(min_opportunity_score))
     ]
 
-    filtered_rows.sort(
-        key=lambda item: (
-            _safe_number(item.get("discount_percentage")) if _safe_number(item.get("discount_percentage")) is not None else -9999.0,
-            int(_safe_score(item.get("opportunity_score")) or -1),
-        ),
-        reverse=True,
-    )
+    filtered_rows.sort(key=lambda item: int(_safe_score(item.get("opportunity_score")) or -1), reverse=True)
 
     table_rows = []
     for row in filtered_rows:
