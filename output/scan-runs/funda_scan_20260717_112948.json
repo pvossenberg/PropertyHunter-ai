@@ -1,0 +1,20 @@
+{
+  "source": "funda",
+  "configuration": {
+    "start_url": "https://www.funda.nl/zoeken/koop/?selected_area=%5B%22s-hertogenbosch%22%5D",
+    "max_pages": 1,
+    "timeout_seconds": 12.0
+  },
+  "summary": {
+    "listings_found": 0,
+    "listings_imported": 0,
+    "fully_imported": 0,
+    "partially_imported": 0,
+    "listings_failed": 0,
+    "average_import_time_seconds": 0.0,
+    "total_elapsed_seconds": 0.374,
+    "warnings": []
+  },
+  "properties": [],
+  "failed_records": []
+}

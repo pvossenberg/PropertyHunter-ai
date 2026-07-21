@@ -222,6 +222,91 @@ class DealFinderFoundationTests(unittest.TestCase):
         self.assertTrue(changed["changed"])
         self.assertEqual(changed["change_type"], "listing_status_change")
 
+    def test_missing_listing_only_becomes_inactive_after_two_consecutive_misses(self):
+        db = InMemoryDatabaseService()
+        source = db.upsert_listing_source(name="klusvastgoed.nl", source_type="portal", base_url=None, is_enabled=True, configuration={})
+        source_id = source.get("id")
+
+        listing_active = db.upsert_listing(
+            source_id=source_id,
+            external_listing_id="a-1",
+            source_url="https://example.com/a-1",
+            title="A",
+            address="Straat 1",
+            city="Rotterdam",
+            asking_price=300000,
+            surface_m2=70,
+            property_type="woning",
+            listing_status="active",
+            raw_payload={},
+        )
+        listing_missing = db.upsert_listing(
+            source_id=source_id,
+            external_listing_id="a-2",
+            source_url="https://example.com/a-2",
+            title="B",
+            address="Straat 2",
+            city="Rotterdam",
+            asking_price=320000,
+            surface_m2=72,
+            property_type="woning",
+            listing_status="active",
+            raw_payload={},
+        )
+
+        db._insert_row(
+            "scan_runs",
+            {
+                "id": "scan-1",
+                "source_id": source_id,
+                "started_at": "2026-07-20T10:00:00+00:00",
+                "completed_at": "2026-07-20T10:01:00+00:00",
+                "status": "completed",
+                "metadata": {"seen_listing_ids": [listing_active["id"], listing_missing["id"]]},
+            },
+        )
+        db._insert_row(
+            "scan_runs",
+            {
+                "id": "scan-2",
+                "source_id": source_id,
+                "started_at": "2026-07-20T10:30:00+00:00",
+                "completed_at": "2026-07-20T10:31:00+00:00",
+                "status": "completed",
+                "metadata": {"seen_listing_ids": [listing_active["id"]]},
+            },
+        )
+
+        first = db.mark_missing_listings_inactive(
+            source_id=source_id,
+            current_scan_run_id="scan-2",
+            current_listing_ids=[listing_active["id"]],
+        )
+        self.assertEqual(first["marked_inactive"], 0)
+        self.assertTrue(any(row.get("id") == listing_missing["id"] and row.get("is_active") for row in db._tables["listings"]))
+
+        db._insert_row(
+            "scan_runs",
+            {
+                "id": "scan-3",
+                "source_id": source_id,
+                "started_at": "2026-07-20T11:00:00+00:00",
+                "completed_at": "2026-07-20T11:01:00+00:00",
+                "status": "completed",
+                "metadata": {"seen_listing_ids": [listing_active["id"]]},
+            },
+        )
+
+        second = db.mark_missing_listings_inactive(
+            source_id=source_id,
+            current_scan_run_id="scan-3",
+            current_listing_ids=[listing_active["id"]],
+        )
+        self.assertEqual(second["marked_inactive"], 1)
+        updated_missing = next(row for row in db._tables["listings"] if row.get("id") == listing_missing["id"])
+        self.assertFalse(updated_missing.get("is_active"))
+        self.assertEqual(updated_missing.get("listing_status"), "inactive")
+
     def test_ranking_with_complete_data(self):
         listing = NormalizedListing(
             source_name="manual",

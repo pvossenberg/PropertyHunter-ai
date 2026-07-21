@@ -1,0 +1,88 @@
+{
+  "source": "funda.nl",
+  "mode": "dry-run",
+  "cities": [
+    "Breda"
+  ],
+  "filters": {
+    "min_price": 0,
+    "max_price": 0,
+    "min_living_area": 0,
+    "max_pages_per_city": 1
+  },
+  "summary": {
+    "listings_found": 1,
+    "listings_imported": 1,
+    "new_listings": 0,
+    "changed_listings": 0,
+    "unchanged_listings": 1,
+    "price_reductions": 0,
+    "failed_listings": 0,
+    "duration_seconds": 0.341,
+    "rows_returned": 1,
+    "failed_cities": 0
+  },
+  "per_city_results": [
+    {
+      "city": "Breda",
+      "mode": "dry-run",
+      "start_url": "https://www.funda.nl/zoeken/koop/?selected_area=%5B%22breda%22%5D",
+      "http_status": 200,
+      "http_status_error": null,
+      "result": {
+        "ok": true,
+        "source": "funda",
+        "output_path": "output/scan-runs/funda_scan_20260717_204900.json",
+        "listings_found": 1,
+        "listings_imported": 1,
+        "fully_imported": 0,
+        "partially_imported": 1,
+        "listings_failed": 0,
+        "average_import_time_seconds": 0.0,
+        "warnings": [],
+        "failed_records": []
+      },
+      "rows_found": 1,
+      "ok": true,
+      "error": null
+    }
+  ],
+  "top_rows": [
+    {
+      "adres": "Voorbeeldstraat 1 Breda",
+      "plaats": "Breda",
+      "vraagprijs": 450000.0,
+      "woonoppervlak": 90.0,
+      "funda_woonoppervlak": 90.0,
+      "bag_oppervlak": 88.0,
+      "gebruikt_rekenoppervlak": 88.0,
+      "bron_rekenoppervlak": "BAG",
+      "funda_bag_verschil_m2": 2.0,
+      "funda_bag_verschil_pct": 2.27,
+      "perceel": null,
+      "slaapkamers": 3,
+      "energielabel": "A",
+      "bouwjaar": 1999,
+      "price_reduction_count": 0,
+      "price_per_m2": 5113.64,
+      "asking_price_per_m2": 5113.64,
+      "woz_per_m2": 4545.45,
+      "bag_usage_purpose": "woonfunctie",
+      "bag_bouwjaar": 1999,
+      "bag_confidence_score": 93,
+      "bag_quality_flags": [],
+      "investment_score": 30,
+      "opportunity_score": 29,
+      "source_url": "https://www.funda.nl/detail/koop/breda/appartement-1/11111111/",
+      "city_avg_price_per_m2": 5113.64,
+      "difference_vs_city_avg_pct": 0.0,
+      "price_per_m2_percentile": 0.0,
+      "split_potential": 45,
+      "vertical_extension_potential": 23,
+      "rental_potential": 60,
+      "renovation_potential": 10,
+      "overall_investment_score": 34,
+      "investment_recommendation": "★ Avoid"
+    }
+  ]
+}

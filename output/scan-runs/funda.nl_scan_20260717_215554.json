@@ -1,0 +1,99 @@
+{
+  "source": "funda.nl",
+  "mode": "dry-run",
+  "cities": [
+    "Rotterdam",
+    "Utrecht",
+    "Eindhoven",
+    "Groningen"
+  ],
+  "filters": {
+    "min_price": 250000,
+    "max_price": 650000,
+    "min_living_area": 80,
+    "max_pages_per_city": 1
+  },
+  "summary": {
+    "listings_found": 4,
+    "listings_imported": 4,
+    "new_listings": 0,
+    "changed_listings": 0,
+    "unchanged_listings": 4,
+    "price_reductions": 0,
+    "failed_listings": 0,
+    "duration_seconds": 0.0,
+    "rows_returned": 0,
+    "failed_cities": 0
+  },
+  "per_city_results": [
+    {
+      "city": "Rotterdam",
+      "mode": "dry-run",
+      "start_url": "https://www.funda.nl/zoeken/koop/?selected_area=%5B%22rotterdam%22%5D&price=%22250000-650000%22&floor_area=%2280-%22",
+      "http_status": 200,
+      "http_status_error": null,
+      "result": {
+        "ok": true,
+        "listings_found": 1,
+        "listings_imported": 1,
+        "listings_failed": 0,
+        "output_path": ""
+      },
+      "rows_found": 0,
+      "ok": true,
+      "error": null
+    },
+    {
+      "city": "Utrecht",
+      "mode": "dry-run",
+      "start_url": "https://www.funda.nl/zoeken/koop/?selected_area=%5B%22utrecht%22%5D&price=%22250000-650000%22&floor_area=%2280-%22",
+      "http_status": 200,
+      "http_status_error": null,
+      "result": {
+        "ok": true,
+        "listings_found": 1,
+        "listings_imported": 1,
+        "listings_failed": 0,
+        "output_path": ""
+      },
+      "rows_found": 0,
+      "ok": true,
+      "error": null
+    },
+    {
+      "city": "Eindhoven",
+      "mode": "dry-run",
+      "start_url": "https://www.funda.nl/zoeken/koop/?selected_area=%5B%22eindhoven%22%5D&price=%22250000-650000%22&floor_area=%2280-%22",
+      "http_status": 200,
+      "http_status_error": null,
+      "result": {
+        "ok": true,
+        "listings_found": 1,
+        "listings_imported": 1,
+        "listings_failed": 0,
+        "output_path": ""
+      },
+      "rows_found": 0,
+      "ok": true,
+      "error": null
+    },
+    {
+      "city": "Groningen",
+      "mode": "dry-run",
+      "start_url": "https://www.funda.nl/zoeken/koop/?selected_area=%5B%22groningen%22%5D&price=%22250000-650000%22&floor_area=%2280-%22",
+      "http_status": 200,
+      "http_status_error": null,
+      "result": {
+        "ok": true,
+        "listings_found": 1,
+        "listings_imported": 1,
+        "listings_failed": 0,
+        "output_path": ""
+      },
+      "rows_found": 0,
+      "ok": true,
+      "error": null
+    }
+  ],
+  "top_rows": []
+}

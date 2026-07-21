@@ -8,7 +8,7 @@ from .permit import PermitRecord
 from .transaction import PropertyTransaction
 
 
-LISTING_STATUSES = {"active", "under_offer", "sold_subject_to_contract", "withdrawn", "auction", "sold", "unknown"}
+LISTING_STATUSES = {"active", "inactive", "under_offer", "sold_subject_to_contract", "withdrawn", "auction", "sold", "unknown"}
 
 
 @dataclass

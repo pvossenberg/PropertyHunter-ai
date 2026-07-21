@@ -653,6 +653,51 @@ class DatabaseService:
                 return self._update_row("deal_candidates", str(row_id), payload)
         return self._insert_row("deal_candidates", payload)
 
+    def mark_missing_listings_inactive(
+        self,
+        *,
+        source_id: str | None,
+        current_scan_run_id: str | None,
+        current_listing_ids: list[str],
+    ) -> dict[str, Any]:
+        if not isinstance(source_id, str) or not source_id.strip() or not isinstance(current_scan_run_id, str) or not current_scan_run_id.strip():
+            return {"marked_inactive": 0, "evaluated": 0}
+
+        current_seen_ids = {str(item).strip() for item in current_listing_ids if str(item).strip()}
+        runs = self._fetch_rows("scan_runs", filters={"source_id": source_id.strip()}, limit=20, order_column="started_at")
+        completed_runs = [run for run in runs if str(run.get("status") or "").lower() == "completed"]
+        current_run = next((run for run in completed_runs if str(run.get("id") or "") == current_scan_run_id.strip()), {})
+        previous_run = next((run for run in completed_runs if str(run.get("id") or "") != current_scan_run_id.strip()), {})
+
+        previous_seen_ids = _extract_seen_listing_ids(previous_run.get("metadata"))
+        if not previous_seen_ids:
+            return {"marked_inactive": 0, "evaluated": 0}
+
+        source_listings = self._fetch_rows("listings", limit=5000, filters={"source_id": source_id.strip()})
+        marked_inactive = 0
+        evaluated = 0
+        for row in source_listings:
+            listing_id = str(row.get("id") or "").strip()
+            if not listing_id:
+                continue
+            if listing_id in current_seen_ids:
+                continue
+            evaluated += 1
+            if listing_id not in previous_seen_ids:
+                updated = self._update_row(
+                    "listings",
+                    listing_id,
+                    {
+                        "is_active": False,
+                        "listing_status": "inactive",
+                        "updated_at": _utc_now_iso(),
+                    },
+                )
+                if updated:
+                    marked_inactive += 1
+
+        return {"marked_inactive": marked_inactive, "evaluated": evaluated}
+
     def list_deal_candidates(
         self,
         *,
@@ -1044,3 +1089,25 @@ class DatabaseService:
             "source": extracted.get("listing_history_source"),
             "is_current": True,
         }
+
+
+def _extract_seen_listing_ids(metadata: Any) -> set[str]:
+    if not isinstance(metadata, dict):
+        return set()
+    ids: set[str] = set()
+    candidates = _as_list(metadata.get("seen_listing_ids"))
+    if candidates:
+        for item in candidates:
+            text = str(item or "").strip()
+            if text:
+                ids.add(text)
+        return ids
+
+    record_results = _as_list(metadata.get("record_results"))
+    for item in record_results:
+        if not isinstance(item, dict):
+            continue
+        listing_id = str(item.get("listing_id") or "").strip()
+        if listing_id:
+            ids.add(listing_id)
+    return ids
