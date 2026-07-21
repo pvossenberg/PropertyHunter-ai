@@ -630,6 +630,68 @@ def _run_scan_cli(argv: list[str]) -> int:
     return 0 if successful_runs else 1
 
 
+def _run_auto_scan_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Run automatic background scans for configured portal sources.")
+    parser.add_argument("--interval-minutes", type=int, default=15, help="Interval in minutes between scan cycles")
+    parser.add_argument("--max-pages", type=int, default=1, help="Maximum paginated pages per source")
+    parser.add_argument("--timeout-seconds", type=float, default=12.0, help="HTTP timeout per request in seconds")
+    parser.add_argument("--once", action="store_true", help="Run a single scan cycle and exit")
+    parser.add_argument("--lock-file", default="/tmp/propertyhunter-background-scan.lock", help="Lock file path to prevent concurrent background scan loops")
+    args = parser.parse_args(argv)
+
+    if not DATABASE_SERVICE.is_enabled:
+        print("Database is not enabled. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY first.")
+        return 1
+
+    interval_minutes = max(1, int(args.interval_minutes or 15))
+    lock_path = Path(str(args.lock_file or "/tmp/propertyhunter-background-scan.lock"))
+
+    try:
+        lock_context = _exclusive_scan_lock(lock_path)
+        lock_handle = lock_context.__enter__()
+    except BlockingIOError:
+        print(f"Background scan loop is already running: {lock_path}")
+        return 0
+    except Exception as error:
+        print(f"Could not acquire background scan lock: {type(error).__name__}: {error}")
+        return 1
+
+    try:
+        cycle_number = 0
+        while True:
+            cycle_number += 1
+            started_at = datetime.now(timezone.utc).isoformat()
+            print(f"[auto-scan] cycle={cycle_number} started_at={started_at}")
+
+            cycle = DEAL_FINDER_ORCHESTRATOR.run_background_scan_cycle(
+                max_pages=max(1, int(args.max_pages or 1)),
+                timeout_seconds=float(args.timeout_seconds or 12.0),
+                only_new_listings=True,
+            )
+
+            print(
+                "[auto-scan] summary "
+                f"sources={cycle.get('sources_succeeded')}/{cycle.get('sources_total')} "
+                f"new={cycle.get('new_total')} changed={cycle.get('changed_total')} "
+                f"duplicates={cycle.get('duplicates_skipped_total')} imported={cycle.get('imported_total')}"
+            )
+            for item in cycle.get("results") or []:
+                status = "ok" if item.get("ok") else "error"
+                print(
+                    f"- [{status}] {item.get('source')}: "
+                    f"new={item.get('new')} changed={item.get('changed')} "
+                    f"duplicates={item.get('duplicates_skipped')} imported={item.get('listings_imported')}"
+                    + (f" | {item.get('error')}" if item.get("error") else "")
+                )
+
+            if bool(args.once):
+                return 0 if cycle.get("ok") else 1
+
+            time.sleep(interval_minutes * 60)
+    finally:
+        lock_context.__exit__(None, None, None)
+
+
 def _run_klusvastgoed_scan_from_ui(
     *,
     municipality: str,
@@ -4215,6 +4277,8 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "auto-scan":
+        raise SystemExit(_run_auto_scan_cli(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "scan":
         raise SystemExit(_run_scan_cli(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "klusvastgoed-national":

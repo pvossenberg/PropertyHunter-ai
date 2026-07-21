@@ -6,9 +6,13 @@ from typing import Iterable
 from deal_finder.sources.base import ListingSourceAdapter
 from deal_finder.sources.beleggingspanden import BeleggingspandenAdapter
 from deal_finder.sources.funda import FundaAdapter
+from deal_finder.sources.funda_business import FundaBusinessAdapter
 from deal_finder.sources.generic_feed import GenericFeedAdapter
+from deal_finder.sources.huislijn import HuislijnAdapter
 from deal_finder.sources.jaap import JaapAdapter
+from deal_finder.sources.klusvastgoed import KlusvastgoedAdapter
 from deal_finder.sources.marktplaats import MarktplaatsAdapter
+from deal_finder.sources.pararius import ParariusAdapter
 
 
 @dataclass
@@ -49,9 +53,13 @@ def build_default_source_registry() -> SourceAdapterRegistry:
     return SourceAdapterRegistry(
         adapters=[
             FundaAdapter(),
+            FundaBusinessAdapter(),
             JaapAdapter(),
+            HuislijnAdapter(),
+            ParariusAdapter(),
             BeleggingspandenAdapter(),
             MarktplaatsAdapter(),
+            KlusvastgoedAdapter(),
             GenericFeedAdapter(),
         ]
     )
@@ -70,8 +78,16 @@ def _adapter_keys(adapter: ListingSourceAdapter) -> set[str]:
 
     if base_name_normalized == "funda nl":
         keys.update({"funda", "funda nl"})
+    if base_name_normalized == "fundainbusinessnl":
+        keys.update({"funda in business", "funda business", "fundainbusiness"})
     if base_name_normalized == "beleggingspanden nl":
         keys.update({"beleggingspanden", "beleggings panden"})
+    if base_name_normalized == "huislijn nl":
+        keys.update({"huislijn"})
+    if base_name_normalized == "pararius nl":
+        keys.update({"pararius"})
+    if base_name_normalized == "klusvastgoed nl":
+        keys.update({"klusvastgoed", "klus vastgoed"})
 
     return {key for key in keys if key}
 

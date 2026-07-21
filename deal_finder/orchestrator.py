@@ -19,28 +19,73 @@ from services.property_enrichment import PropertyEnrichmentEngine
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_SOURCES = [
-    {"name": "Funda", "source_type": "portal", "base_url": "https://www.funda.nl", "is_enabled": False},
-    {"name": "Funda in Business", "source_type": "portal", "base_url": "https://www.fundainbusiness.nl", "is_enabled": False},
+    {
+        "name": "Funda",
+        "source_type": "portal",
+        "base_url": "https://www.funda.nl",
+        "is_enabled": True,
+        "scan_frequency_minutes": 15,
+        "configuration": {"only_new_listings": True},
+    },
+    {
+        "name": "Funda in Business",
+        "source_type": "portal",
+        "base_url": "https://www.fundainbusiness.nl",
+        "is_enabled": True,
+        "scan_frequency_minutes": 15,
+        "configuration": {"only_new_listings": True},
+    },
     {
         "name": "klusvastgoed.nl",
         "source_type": "portal",
         "base_url": "https://www.klusvastgoed.nl",
         "is_enabled": True,
+        "scan_frequency_minutes": 15,
         "configuration": {
             "mode": "national",
             "include_in_combined_ranking": False,
+            "only_new_listings": True,
             "notes": "Live import enabled; combined ranking stays opt-in.",
         },
     },
-    {"name": "Pararius", "source_type": "portal", "base_url": "https://www.pararius.nl", "is_enabled": False},
-    {"name": "Jaap", "source_type": "portal", "base_url": "https://www.jaap.nl", "is_enabled": False},
-    {"name": "Huislijn", "source_type": "portal", "base_url": "https://www.huislijn.nl", "is_enabled": False},
+    {
+        "name": "Pararius",
+        "source_type": "portal",
+        "base_url": "https://www.pararius.nl",
+        "is_enabled": True,
+        "scan_frequency_minutes": 15,
+        "configuration": {"only_new_listings": True},
+    },
+    {
+        "name": "Jaap",
+        "source_type": "portal",
+        "base_url": "https://www.jaap.nl",
+        "is_enabled": True,
+        "scan_frequency_minutes": 15,
+        "configuration": {"only_new_listings": True},
+    },
+    {
+        "name": "Huislijn",
+        "source_type": "portal",
+        "base_url": "https://www.huislijn.nl",
+        "is_enabled": True,
+        "scan_frequency_minutes": 15,
+        "configuration": {"only_new_listings": True},
+    },
     {"name": "Hormax", "source_type": "broker", "base_url": None, "is_enabled": False},
     {"name": "Horecahuis", "source_type": "broker", "base_url": "https://www.horecahuis.nl", "is_enabled": False},
     {"name": "Local broker websites", "source_type": "broker", "base_url": None, "is_enabled": False},
 ]
 
 MISSING_TEXT_VALUES = {"", "unknown", "onbekend", "n.v.t.", "nvt", "none", "null"}
+BACKGROUND_SCAN_SOURCE_NAMES: tuple[str, ...] = (
+    "Funda",
+    "Klusvastgoed",
+    "Funda in Business",
+    "Huislijn",
+    "Jaap",
+    "Pararius",
+)
 
 
 def _normalize_text(value: Any) -> str:
@@ -225,6 +270,7 @@ class DealFinderOrchestrator:
             }
 
         source_info = adapter.get_source_info()
+        only_new_listings = _bool_from_config(config.get("only_new_listings"), default=False)
         ranking_enabled = True
         if _is_klusvastgoed_source(source_info.source_name):
             ranking_enabled = _bool_from_config(config.get("include_in_combined_ranking"), default=False)
@@ -281,11 +327,12 @@ class DealFinderOrchestrator:
             source_name=source_info.source_name,
             results=results,
             include_in_combined_ranking=ranking_enabled,
+            only_new_listings=only_new_listings,
         )
         adapter_stats = adapter.get_last_fetch_stats()
 
         listings_found = max(int(adapter_stats.get("listings_found") or 0), ingestion["found"])
-        duplicates_skipped = int(adapter_stats.get("duplicates_skipped") or 0)
+        duplicates_skipped = int(adapter_stats.get("duplicates_skipped") or 0) + int(ingestion.get("duplicates_skipped") or 0)
         failed_listings = int(adapter_stats.get("failed_listings") or 0) + ingestion["failed"]
 
         scan_metadata = {
@@ -311,11 +358,13 @@ class DealFinderOrchestrator:
             metadata=scan_metadata,
         )
 
-        inactive_result = self.database_service.mark_missing_listings_inactive(
-            source_id=str(source_id) if source_id else None,
-            current_scan_run_id=scan_id,
-            current_listing_ids=ingestion["listing_ids"],
-        )
+        inactive_result: dict[str, Any] = {}
+        if not only_new_listings:
+            inactive_result = self.database_service.mark_missing_listings_inactive(
+                source_id=str(source_id) if source_id else None,
+                current_scan_run_id=scan_id,
+                current_listing_ids=ingestion["listing_ids"],
+            )
         if inactive_result:
             scan_metadata["inactive_result"] = inactive_result
             self.database_service.complete_scan_run(
@@ -339,6 +388,7 @@ class DealFinderOrchestrator:
             "new": ingestion["new"],
             "changed": ingestion["changed"],
             "inactive_result": inactive_result,
+            "only_new_listings": only_new_listings,
             "ranking_enabled": ranking_enabled,
             "ranking_deferred": not ranking_enabled,
             "ranking_deferred_count": ingestion["ranking_deferred_count"],
@@ -357,6 +407,7 @@ class DealFinderOrchestrator:
         source_name: str,
         results: list[SourceRecordResult],
         include_in_combined_ranking: bool = True,
+        only_new_listings: bool = False,
     ) -> dict[str, Any]:
         existing_rows = self.database_service.list_raw_listings(limit=5000)
         warnings: list[str] = []
@@ -369,6 +420,7 @@ class DealFinderOrchestrator:
         created = 0
         changed = 0
         failed = 0
+        duplicates_skipped = 0
         ranking_deferred_count = 0
 
         for result in results:
@@ -395,6 +447,20 @@ class DealFinderOrchestrator:
                         "warnings": dedupe.warnings,
                     }
                 )
+
+                if only_new_listings and bool(dedupe.matched_listing_id):
+                    duplicates_skipped += 1
+                    record_results.append(
+                        {
+                            "record_index": result.record_index,
+                            "success": True,
+                            "error": None,
+                            "listing_id": str(dedupe.matched_listing_id),
+                            "source_url": listing.source_url,
+                            "skipped_existing": True,
+                        }
+                    )
+                    continue
 
                 listing_row = self.database_service.upsert_listing(
                     source_id=source_id,
@@ -513,6 +579,7 @@ class DealFinderOrchestrator:
             "found": len(results),
             "imported": imported,
             "failed": failed,
+            "duplicates_skipped": duplicates_skipped,
             "new": created,
             "changed": changed,
             "ranking_deferred_count": ranking_deferred_count,
@@ -521,6 +588,73 @@ class DealFinderOrchestrator:
             "new_listing_ids": new_listing_ids,
             "match_logs": match_logs,
             "record_results": record_results,
+        }
+
+    def run_background_scan_cycle(
+        self,
+        *,
+        source_names: list[str] | None = None,
+        max_pages: int = 1,
+        timeout_seconds: float = 12.0,
+        only_new_listings: bool = True,
+    ) -> dict[str, Any]:
+        targets = [str(name).strip() for name in (source_names or list(BACKGROUND_SCAN_SOURCE_NAMES)) if str(name).strip()]
+        results: list[dict[str, Any]] = []
+
+        for source_name in targets:
+            adapter = self.source_registry.resolve(source_name)
+            if adapter is None:
+                results.append(
+                    {
+                        "source": source_name,
+                        "ok": False,
+                        "error": "Unknown source adapter",
+                        "new": 0,
+                        "changed": 0,
+                        "duplicates_skipped": 0,
+                        "listings_imported": 0,
+                    }
+                )
+                continue
+
+            source_info = adapter.get_source_info()
+            config: dict[str, Any] = {
+                "max_pages": max(1, int(max_pages or 1)),
+                "timeout_seconds": float(timeout_seconds or 12.0),
+                "only_new_listings": bool(only_new_listings),
+            }
+            default_start_url = str(getattr(adapter, "default_start_url", "") or "").strip()
+            if default_start_url:
+                config["start_url"] = default_start_url
+
+            if _is_klusvastgoed_source(source_info.source_name):
+                config["mode"] = "national"
+                config["include_in_combined_ranking"] = False
+
+            run = self.import_from_source(source_name, configuration=config)
+            results.append(
+                {
+                    "source": source_name,
+                    "ok": bool(run.get("ok")),
+                    "error": run.get("error"),
+                    "new": int(run.get("new") or 0),
+                    "changed": int(run.get("changed") or 0),
+                    "duplicates_skipped": int(run.get("duplicates_skipped") or 0),
+                    "listings_imported": int(run.get("listings_imported") or 0),
+                }
+            )
+
+        successful = [item for item in results if item.get("ok")]
+        return {
+            "ok": bool(successful),
+            "sources_total": len(results),
+            "sources_succeeded": len(successful),
+            "sources_failed": len(results) - len(successful),
+            "new_total": sum(int(item.get("new") or 0) for item in results),
+            "changed_total": sum(int(item.get("changed") or 0) for item in results),
+            "duplicates_skipped_total": sum(int(item.get("duplicates_skipped") or 0) for item in results),
+            "imported_total": sum(int(item.get("listings_imported") or 0) for item in results),
+            "results": results,
         }
 
     def _enrich_listing_with_public_data(

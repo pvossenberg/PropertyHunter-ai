@@ -5,9 +5,12 @@ from deal_finder.models import NormalizedListing
 from deal_finder.orchestrator import DealFinderOrchestrator
 from deal_finder.sources.base import ListingSourceAdapter, SourceRecordResult
 from deal_finder.sources.beleggingspanden import BeleggingspandenAdapter
+from deal_finder.sources.funda_business import FundaBusinessAdapter
+from deal_finder.sources.huislijn import HuislijnAdapter
 from deal_finder.sources.jaap import JaapAdapter
 from deal_finder.sources.klusvastgoed import KlusvastgoedAdapter
 from deal_finder.sources.marktplaats import MarktplaatsAdapter
+from deal_finder.sources.pararius import ParariusAdapter
 from deal_finder.sources.registry import SourceAdapterRegistry
 
 
@@ -220,11 +223,24 @@ class SourceScanOrchestratorTests(unittest.TestCase):
         self.assertIsNotNone(registry.resolve("Funda.nl"))
 
     def test_registry_resolves_new_source_aliases(self):
-        registry = SourceAdapterRegistry(adapters=[JaapAdapter(), BeleggingspandenAdapter(), MarktplaatsAdapter(), KlusvastgoedAdapter()])
+        registry = SourceAdapterRegistry(
+            adapters=[
+                JaapAdapter(),
+                BeleggingspandenAdapter(),
+                MarktplaatsAdapter(),
+                KlusvastgoedAdapter(),
+                FundaBusinessAdapter(),
+                HuislijnAdapter(),
+                ParariusAdapter(),
+            ]
+        )
         self.assertIsNotNone(registry.resolve("jaap"))
         self.assertIsNotNone(registry.resolve("beleggingspanden"))
         self.assertIsNotNone(registry.resolve("marktplaats"))
         self.assertIsNotNone(registry.resolve("klusvastgoed"))
+        self.assertIsNotNone(registry.resolve("funda in business"))
+        self.assertIsNotNone(registry.resolve("huislijn"))
+        self.assertIsNotNone(registry.resolve("pararius"))
 
     def test_import_from_source_returns_requested_stats(self):
         adapter = FakeSourceAdapter()
@@ -266,6 +282,51 @@ class SourceScanOrchestratorTests(unittest.TestCase):
         self.assertTrue(second["ok"])
         self.assertEqual(len(db.listings), 2)
         self.assertEqual(len({item.get("id") for item in db.listings}), 2)
+
+    def test_only_new_mode_skips_existing_listings(self):
+        adapter = FakeSourceAdapter(with_failure_payload=False)
+        registry = SourceAdapterRegistry(adapters=[adapter])
+        db = SourceScanDbStub()
+        orchestrator = DealFinderOrchestrator(db, source_registry=registry)
+
+        first = orchestrator.import_from_source("funda", {"start_url": "https://www.funda.nl/zoeken/koop"})
+        second = orchestrator.import_from_source(
+            "funda",
+            {
+                "start_url": "https://www.funda.nl/zoeken/koop",
+                "only_new_listings": True,
+            },
+        )
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertEqual(second["new"], 0)
+        self.assertEqual(second["changed"], 0)
+        self.assertEqual(second["listings_imported"], 0)
+        self.assertGreaterEqual(second["duplicates_skipped"], 2)
+
+    def test_background_scan_cycle_runs_multiple_sources(self):
+        funda = FakeSourceAdapter(with_failure_payload=False)
+        funda.default_start_url = "https://www.funda.nl/zoeken/koop"
+        jaap = FakeSourceAdapter(with_failure_payload=False)
+        jaap.source_name = "jaap.nl"
+        jaap.default_start_url = "https://www.jaap.nl/"
+        klus = FakeKlusvastgoedSourceAdapter(with_failure_payload=False)
+        klus.default_start_url = "https://www.klusvastgoed.nl/kluswoning-rotterdam"
+        registry = SourceAdapterRegistry(adapters=[funda, jaap, klus])
+        db = SourceScanDbStub()
+        orchestrator = DealFinderOrchestrator(db, source_registry=registry)
+
+        result = orchestrator.run_background_scan_cycle(
+            source_names=["Funda", "Jaap", "Klusvastgoed"],
+            max_pages=1,
+            timeout_seconds=1.0,
+            only_new_listings=True,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["sources_total"], 3)
+        self.assertEqual(result["sources_failed"], 0)
 
     def test_klusvastgoed_import_defers_combined_ranking_by_default(self):
         adapter = FakeKlusvastgoedSourceAdapter(with_failure_payload=False)
