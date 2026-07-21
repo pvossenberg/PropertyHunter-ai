@@ -16,9 +16,11 @@ from app import (
     _label_score,
     _load_funda_place_options,
     _merge_scan_cities,
+    _run_klusvastgoed_scan_from_ui,
     _selected_municipality_summary,
     _run_funda_scan_from_ui,
     _run_source_scan,
+    _resolve_scan_sources,
     _render_analysis_result,
 )
 from deal_finder.models import NormalizedListing
@@ -33,6 +35,11 @@ from services.calculations import calculate_days_on_market, calculate_discount_p
 
 
 class PropertyHunterTests(unittest.TestCase):
+    def test_scan_all_includes_enabled_klusvastgoed_source(self):
+        sources = _resolve_scan_sources(source_names=None, scan_all=True)
+        normalized_sources = {str(item).strip().lower() for item in sources if str(item).strip()}
+        self.assertIn("klusvastgoed.nl", normalized_sources)
+
     def test_load_funda_place_options_uses_municipalities_and_keeps_defaults(self):
         import app as app_module
 
@@ -53,6 +60,7 @@ class PropertyHunterTests(unittest.TestCase):
         self.assertIn("Utrecht", options)
         self.assertIn("Eindhoven", options)
         self.assertIn("Groningen", options)
+        self.assertIn("Den Haag", options)
 
     def test_build_funda_start_url_uses_selected_municipality(self):
         expected_by_city = {
@@ -205,6 +213,61 @@ class PropertyHunterTests(unittest.TestCase):
         row = (result.get("top_rows") or [])[0]
         self.assertEqual(row.get("adres"), "Mathenesserlaan 369 A/B")
         self.assertEqual(row.get("plaats"), "Rotterdam")
+
+    def test_funda_scan_continues_when_one_city_fails(self):
+        import app as app_module
+
+        selected_cities = ["Breda", "Rotterdam"]
+        captured_start_urls: list[str] = []
+
+        class FakeDatabaseServiceCtor:
+            def __init__(self):
+                self.is_enabled = False
+
+        def fake_run_source_scan(source_name, **kwargs):
+            self.assertEqual(source_name, "funda")
+            start_url = str(kwargs.get("start_url") or "")
+            captured_start_urls.append(start_url)
+            if "breda" in start_url:
+                raise RuntimeError("boom Breda")
+            return {
+                "ok": True,
+                "listings_found": 2,
+                "listings_imported": 2,
+                "listings_failed": 0,
+                "output_path": "",
+            }
+
+        original_run_source_scan = app_module._run_source_scan
+        original_probe_http_status = app_module._probe_http_status
+        original_database_service_cls = app_module.DatabaseService
+        try:
+            app_module._run_source_scan = fake_run_source_scan
+            app_module._probe_http_status = lambda url, timeout_seconds=12.0: (200, None)
+            app_module.DatabaseService = FakeDatabaseServiceCtor
+
+            result = _run_funda_scan_from_ui(
+                cities=selected_cities,
+                min_price=0,
+                max_price=0,
+                min_living_area=0,
+                max_pages_per_city=1,
+                dry_run=True,
+            )
+        finally:
+            app_module._run_source_scan = original_run_source_scan
+            app_module._probe_http_status = original_probe_http_status
+            app_module.DatabaseService = original_database_service_cls
+
+        self.assertEqual(len(captured_start_urls), 2)
+        self.assertEqual(result["failed_cities"], 1)
+        self.assertEqual(result["listings_found"], 2)
+        self.assertEqual(len(result.get("per_city_results") or []), 2)
+        failed_city = next(item for item in result["per_city_results"] if not item.get("ok"))
+        successful_city = next(item for item in result["per_city_results"] if item.get("ok"))
+        self.assertEqual(failed_city["city"], "Breda")
+        self.assertIn("RuntimeError: boom Breda", failed_city["error"])
+        self.assertEqual(successful_city["city"], "Rotterdam")
 
     def test_run_source_scan_writes_json_and_counts_results(self):
         class FakeDatabaseService:
@@ -573,6 +636,86 @@ class PropertyHunterTests(unittest.TestCase):
         self.assertEqual(top_row["bag_confidence_score"], 93)
         self.assertIsNotNone(top_row.get("investment_score"))
         self.assertIsNotNone(top_row.get("opportunity_score"))
+
+    def test_klusvastgoed_dry_run_uses_selected_municipality_without_database_writes(self):
+        import app as app_module
+
+        class FakeAdapter:
+            source_name = "klusvastgoed.nl"
+            default_start_url = "https://www.klusvastgoed.nl/kluswoning-amsterdam"
+
+            def validate_configuration(self, configuration):
+                return True, []
+
+            def build_start_url_for_municipality(self, municipality: str) -> str:
+                return f"https://www.klusvastgoed.nl/kluswoning-{municipality.lower()}"
+
+            def load_and_normalize_listings(self, configuration):
+                listing = NormalizedListing(
+                    source_name=self.source_name,
+                    external_listing_id="pand::rotterdam::nystadstraat-11",
+                    source_url="https://www.klusvastgoed.nl/pand/rotterdam/nystadstraat-11",
+                    title="Nystadstraat 11 Rotterdam",
+                    address="Nystadstraat 11",
+                    city="Rotterdam",
+                    asking_price=329000.0,
+                    surface_m2=106.0,
+                    property_type="eengezinswoning",
+                    listing_status="active",
+                    raw_payload={
+                        "source_url": "https://www.klusvastgoed.nl/pand/rotterdam/nystadstraat-11",
+                        "address": "Nystadstraat 11",
+                        "city": "Rotterdam",
+                        "asking_price": 329000.0,
+                        "surface_m2": 106.0,
+                        "living_area": 106.0,
+                        "plot_size": 82.0,
+                        "property_type": "eengezinswoning",
+                        "description": "Testbeschrijving",
+                    },
+                )
+                return [SourceRecordResult(record_index=1, success=True, listing=listing, payload=dict(listing.raw_payload))]
+
+            def get_last_fetch_stats(self):
+                return {"listings_found": 1, "listings_imported": 1, "duplicates_skipped": 0, "failed_listings": 0}
+
+            def to_property_model(self, payload):
+                return Property(
+                    source_url=payload["source_url"],
+                    title="Nystadstraat 11 Rotterdam",
+                    address=payload["address"],
+                    city=payload["city"],
+                    asking_price=329000.0,
+                    surface_m2=106.0,
+                    plot_size_m2=82.0,
+                    property_type="eengezinswoning",
+                    description="Testbeschrijving",
+                    listing_status="active",
+                )
+
+        class FakeRegistry:
+            def __init__(self, adapter):
+                self.adapter = adapter
+
+            def resolve(self, source_name):
+                return self.adapter if source_name == "klusvastgoed" else None
+
+        class FakeOrchestrator:
+            def __init__(self, adapter):
+                self.source_registry = FakeRegistry(adapter)
+
+        original_orchestrator = app_module.DEAL_FINDER_ORCHESTRATOR
+        try:
+            app_module.DEAL_FINDER_ORCHESTRATOR = FakeOrchestrator(FakeAdapter())
+            result = _run_klusvastgoed_scan_from_ui(municipality="Rotterdam", max_pages=1, dry_run=True)
+        finally:
+            app_module.DEAL_FINDER_ORCHESTRATOR = original_orchestrator
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mode"], "dry-run")
+        self.assertEqual(result["municipality"], "Rotterdam")
+        self.assertEqual(result["start_url"], "https://www.klusvastgoed.nl/kluswoning-rotterdam")
+        self.assertEqual(result["listings_imported"], 1)
 
     def test_fetch_page_text_rejects_non_http_urls(self):
         with self.assertRaises(ValueError):

@@ -1,10 +1,12 @@
 import unittest
+from unittest.mock import patch
 
 from deal_finder.models import NormalizedListing
 from deal_finder.orchestrator import DealFinderOrchestrator
 from deal_finder.sources.base import ListingSourceAdapter, SourceRecordResult
 from deal_finder.sources.beleggingspanden import BeleggingspandenAdapter
 from deal_finder.sources.jaap import JaapAdapter
+from deal_finder.sources.klusvastgoed import KlusvastgoedAdapter
 from deal_finder.sources.marktplaats import MarktplaatsAdapter
 from deal_finder.sources.registry import SourceAdapterRegistry
 
@@ -16,6 +18,7 @@ class SourceScanDbStub:
         self.listings = []
         self.scan_runs = []
         self.snapshots = {}
+        self.candidate_calls = []
 
     def upsert_listing_source(self, **kwargs):
         existing = next((item for item in self.sources if item.get("name") == kwargs.get("name")), None)
@@ -113,7 +116,11 @@ class SourceScanDbStub:
         return {}
 
     def create_or_update_deal_candidate(self, **kwargs):
+        self.candidate_calls.append(dict(kwargs))
         return {"id": f"candidate-{kwargs.get('listing_id')}", **kwargs}
+
+    def mark_missing_listings_inactive(self, **kwargs):
+        return {"marked_inactive": 0, "evaluated": 0}
 
 
 class FakeSourceAdapter(ListingSourceAdapter):
@@ -185,17 +192,39 @@ class FakeSourceAdapter(ListingSourceAdapter):
         return results
 
 
+class FakeKlusvastgoedSourceAdapter(FakeSourceAdapter):
+    source_name = "klusvastgoed.nl"
+    source_type = "portal"
+
+
 class SourceScanOrchestratorTests(unittest.TestCase):
+    def test_seed_default_sources_skips_case_variant_duplicates(self):
+        db = SourceScanDbStub()
+        orchestrator = DealFinderOrchestrator(db)
+
+        duplicate_defaults = [
+            {"name": "klusvastgoed.nl", "source_type": "portal", "base_url": "https://www.klusvastgoed.nl", "is_enabled": True},
+            {"name": "Klusvastgoed.nl", "source_type": "portal", "base_url": "https://www.klusvastgoed.nl", "is_enabled": True},
+        ]
+
+        with patch("deal_finder.orchestrator.DEFAULT_SOURCES", duplicate_defaults):
+            seeded = orchestrator.seed_default_sources()
+
+        self.assertEqual(len(seeded), 1)
+        self.assertEqual(len(db.sources), 1)
+        self.assertEqual(db.sources[0]["name"], "klusvastgoed.nl")
+
     def test_registry_resolves_funda_alias(self):
         registry = SourceAdapterRegistry(adapters=[FakeSourceAdapter()])
         self.assertIsNotNone(registry.resolve("funda"))
         self.assertIsNotNone(registry.resolve("Funda.nl"))
 
     def test_registry_resolves_new_source_aliases(self):
-        registry = SourceAdapterRegistry(adapters=[JaapAdapter(), BeleggingspandenAdapter(), MarktplaatsAdapter()])
+        registry = SourceAdapterRegistry(adapters=[JaapAdapter(), BeleggingspandenAdapter(), MarktplaatsAdapter(), KlusvastgoedAdapter()])
         self.assertIsNotNone(registry.resolve("jaap"))
         self.assertIsNotNone(registry.resolve("beleggingspanden"))
         self.assertIsNotNone(registry.resolve("marktplaats"))
+        self.assertIsNotNone(registry.resolve("klusvastgoed"))
 
     def test_import_from_source_returns_requested_stats(self):
         adapter = FakeSourceAdapter()
@@ -223,6 +252,52 @@ class SourceScanOrchestratorTests(unittest.TestCase):
         self.assertEqual(result["listings_imported"], 1)
         self.assertGreaterEqual(result["failed_listings"], 1)
         self.assertEqual(len(result["listing_ids"]), 1)
+
+    def test_second_run_reuses_existing_listings_without_duplicates(self):
+        adapter = FakeSourceAdapter(with_failure_payload=False)
+        registry = SourceAdapterRegistry(adapters=[adapter])
+        db = SourceScanDbStub()
+        orchestrator = DealFinderOrchestrator(db, source_registry=registry)
+
+        first = orchestrator.import_from_source("funda", {"start_url": "https://www.funda.nl/zoeken/koop"})
+        second = orchestrator.import_from_source("funda", {"start_url": "https://www.funda.nl/zoeken/koop"})
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertEqual(len(db.listings), 2)
+        self.assertEqual(len({item.get("id") for item in db.listings}), 2)
+
+    def test_klusvastgoed_import_defers_combined_ranking_by_default(self):
+        adapter = FakeKlusvastgoedSourceAdapter(with_failure_payload=False)
+        registry = SourceAdapterRegistry(adapters=[adapter])
+        db = SourceScanDbStub()
+        orchestrator = DealFinderOrchestrator(db, source_registry=registry)
+
+        result = orchestrator.import_from_source("klusvastgoed", {"start_url": "https://www.klusvastgoed.nl/kluswoning-rotterdam"})
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["ranking_deferred"])
+        self.assertEqual(result["ranking_deferred_count"], 2)
+        self.assertEqual(len(db.candidate_calls), 0)
+
+    def test_klusvastgoed_import_can_opt_in_to_combined_ranking(self):
+        adapter = FakeKlusvastgoedSourceAdapter(with_failure_payload=False)
+        registry = SourceAdapterRegistry(adapters=[adapter])
+        db = SourceScanDbStub()
+        orchestrator = DealFinderOrchestrator(db, source_registry=registry)
+
+        result = orchestrator.import_from_source(
+            "klusvastgoed",
+            {
+                "start_url": "https://www.klusvastgoed.nl/kluswoning-rotterdam",
+                "include_in_combined_ranking": True,
+            },
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["ranking_deferred"])
+        self.assertEqual(result["ranking_deferred_count"], 0)
+        self.assertEqual(len(db.candidate_calls), 2)
 
 
 if __name__ == "__main__":

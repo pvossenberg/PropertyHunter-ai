@@ -21,6 +21,17 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_SOURCES = [
     {"name": "Funda", "source_type": "portal", "base_url": "https://www.funda.nl", "is_enabled": False},
     {"name": "Funda in Business", "source_type": "portal", "base_url": "https://www.fundainbusiness.nl", "is_enabled": False},
+    {
+        "name": "klusvastgoed.nl",
+        "source_type": "portal",
+        "base_url": "https://www.klusvastgoed.nl",
+        "is_enabled": True,
+        "configuration": {
+            "mode": "national",
+            "include_in_combined_ranking": False,
+            "notes": "Live import enabled; combined ranking stays opt-in.",
+        },
+    },
     {"name": "Pararius", "source_type": "portal", "base_url": "https://www.pararius.nl", "is_enabled": False},
     {"name": "Jaap", "source_type": "portal", "base_url": "https://www.jaap.nl", "is_enabled": False},
     {"name": "Huislijn", "source_type": "portal", "base_url": "https://www.huislijn.nl", "is_enabled": False},
@@ -108,6 +119,27 @@ def _updated_metadata_fields(before: dict[str, Any], after: dict[str, Any]) -> l
     return changed
 
 
+def _is_klusvastgoed_source(source_name: str) -> bool:
+    normalized = _safe_text(source_name).lower()
+    return normalized in {"klusvastgoed", "klusvastgoed.nl"}
+
+
+def _bool_from_config(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "ja", "enabled", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "nee", "disabled", "off"}:
+            return False
+    return default
+
+
 class DealFinderOrchestrator:
     def __init__(
         self,
@@ -124,14 +156,24 @@ class DealFinderOrchestrator:
 
     def seed_default_sources(self) -> list[dict[str, Any]]:
         seeded: list[dict[str, Any]] = []
+        seen_names: set[str] = set()
         for source in DEFAULT_SOURCES:
+            source_name = str(source.get("name") or "").strip()
+            if not source_name:
+                continue
+            normalized_name = source_name.lower()
+            if normalized_name in seen_names:
+                continue
+            seen_names.add(normalized_name)
+
             row = self.database_service.upsert_listing_source(
-                name=source["name"],
+                name=source_name,
                 source_type=source["source_type"],
                 base_url=source.get("base_url"),
                 is_enabled=bool(source.get("is_enabled", False)),
                 scan_frequency_minutes=source.get("scan_frequency_minutes"),
-                configuration={"mode": "placeholder", "notes": "No live scraping configured in v0.6 foundation."},
+                configuration=source.get("configuration")
+                or {"mode": "placeholder", "notes": "No live scraping configured in v0.6 foundation."},
             )
             if row:
                 seeded.append(row)
@@ -183,6 +225,16 @@ class DealFinderOrchestrator:
             }
 
         source_info = adapter.get_source_info()
+        ranking_enabled = True
+        if _is_klusvastgoed_source(source_info.source_name):
+            ranking_enabled = _bool_from_config(config.get("include_in_combined_ranking"), default=False)
+            if "include_in_combined_ranking" not in config:
+                config["include_in_combined_ranking"] = False
+            if not ranking_enabled:
+                validation_warnings.append(
+                    "Klusvastgoed listings are imported in review mode; production combined ranking is disabled until explicitly enabled."
+                )
+
         source_row = self.database_service.upsert_listing_source(
             name=source_info.source_name,
             source_type=source_info.source_type,
@@ -228,6 +280,7 @@ class DealFinderOrchestrator:
             source_id=str(source_id) if source_id else None,
             source_name=source_info.source_name,
             results=results,
+            include_in_combined_ranking=ranking_enabled,
         )
         adapter_stats = adapter.get_last_fetch_stats()
 
@@ -239,6 +292,7 @@ class DealFinderOrchestrator:
             "warnings": [*validation_warnings, *ingestion["warnings"]],
             "match_logs": ingestion["match_logs"],
             "record_results": ingestion["record_results"],
+            "seen_listing_ids": ingestion["listing_ids"],
             "source_stats": {
                 "listings_found": listings_found,
                 "listings_imported": ingestion["imported"],
@@ -257,6 +311,23 @@ class DealFinderOrchestrator:
             metadata=scan_metadata,
         )
 
+        inactive_result = self.database_service.mark_missing_listings_inactive(
+            source_id=str(source_id) if source_id else None,
+            current_scan_run_id=scan_id,
+            current_listing_ids=ingestion["listing_ids"],
+        )
+        if inactive_result:
+            scan_metadata["inactive_result"] = inactive_result
+            self.database_service.complete_scan_run(
+                scan_run_id=scan_id,
+                status="completed",
+                items_found=listings_found,
+                items_new=ingestion["new"],
+                items_changed=ingestion["changed"],
+                error_message=None,
+                metadata=scan_metadata,
+            )
+
         return {
             "ok": True,
             "source": source_info.source_name,
@@ -267,6 +338,13 @@ class DealFinderOrchestrator:
             "failed_listings": failed_listings,
             "new": ingestion["new"],
             "changed": ingestion["changed"],
+            "inactive_result": inactive_result,
+            "ranking_enabled": ranking_enabled,
+            "ranking_deferred": not ranking_enabled,
+            "ranking_deferred_count": ingestion["ranking_deferred_count"],
+            "cities_found": int(adapter_stats.get("cities_found") or 0),
+            "municipalities_found": int(adapter_stats.get("municipalities_found") or 0),
+            "provinces_found": int(adapter_stats.get("provinces_found") or 0),
             "listing_ids": ingestion["listing_ids"],
             "new_listing_ids": ingestion["new_listing_ids"],
             "record_results": ingestion["record_results"],
@@ -278,6 +356,7 @@ class DealFinderOrchestrator:
         source_id: str | None,
         source_name: str,
         results: list[SourceRecordResult],
+        include_in_combined_ranking: bool = True,
     ) -> dict[str, Any]:
         existing_rows = self.database_service.list_raw_listings(limit=5000)
         warnings: list[str] = []
@@ -290,6 +369,7 @@ class DealFinderOrchestrator:
         created = 0
         changed = 0
         failed = 0
+        ranking_deferred_count = 0
 
         for result in results:
             if not result.success or result.listing is None:
@@ -379,16 +459,19 @@ class DealFinderOrchestrator:
                 )
                 self.database_service.update_listing_history(str(listing_id), history_result.to_dict())
 
-                ranking = self._rank_listing_from_row(listing_row=listing_row, source_name=source_name, all_rows=existing_rows)
-                self.database_service.create_or_update_deal_candidate(
-                    listing_id=str(listing_id),
-                    property_id=dedupe.matched_property_id,
-                    investment_score=ranking.component_scores.get("investment_score"),
-                    hidden_value_score=ranking.candidate_score,
-                    priority=ranking.priority,
-                    reasons=ranking.reason_codes,
-                    review_status="new",
-                )
+                if include_in_combined_ranking:
+                    ranking = self._rank_listing_from_row(listing_row=listing_row, source_name=source_name, all_rows=existing_rows)
+                    self.database_service.create_or_update_deal_candidate(
+                        listing_id=str(listing_id),
+                        property_id=dedupe.matched_property_id,
+                        investment_score=ranking.component_scores.get("investment_score"),
+                        hidden_value_score=ranking.candidate_score,
+                        priority=ranking.priority,
+                        reasons=ranking.reason_codes,
+                        review_status="new",
+                    )
+                else:
+                    ranking_deferred_count += 1
 
                 if "funda" in _safe_text(source_name).lower():
                     try:
@@ -432,6 +515,7 @@ class DealFinderOrchestrator:
             "failed": failed,
             "new": created,
             "changed": changed,
+            "ranking_deferred_count": ranking_deferred_count,
             "warnings": warnings,
             "listing_ids": listing_ids,
             "new_listing_ids": new_listing_ids,

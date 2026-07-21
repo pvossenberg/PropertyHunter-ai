@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from html import escape
 import json
 import logging
 from pathlib import Path
 import re
+import os
 import sys
 import time
 from typing import Any
@@ -19,6 +22,7 @@ from ai.analyzer import analyze_property
 from config import FUNDA_DEFAULT_SCAN_CITIES
 from deal_finder.orchestrator import DealFinderOrchestrator
 from deal_finder.sources.funda import normalize_funda_area_slug
+from deal_finder.sources.klusvastgoed import KlusvastgoedAdapter, build_klusvastgoed_start_url
 from models.permit import PermitRecord
 from models.property import Property
 from models.transaction import PropertyTransaction
@@ -43,6 +47,94 @@ PROPERTY_HUNTER_WORKFLOW = PropertyHunterEndToEndWorkflow(
     database_service=DATABASE_SERVICE,
 )
 LOGGER = logging.getLogger(__name__)
+
+FUNDA_PLACE_ALIASES: tuple[str, ...] = (
+    "Den Haag",
+)
+
+
+class _ReadOnlyScanDatabaseService:
+    is_enabled = False
+
+
+@contextmanager
+def _exclusive_scan_lock(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+")
+    try:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise
+    except Exception:
+        handle.close()
+        raise
+
+    try:
+        yield handle
+    finally:
+        try:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def _run_klusvastgoed_national_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Run the national Klusvastgoed scan.")
+    parser.add_argument("--max-pages", type=int, default=1000, help="Maximum paginated result pages per city")
+    parser.add_argument("--timeout-seconds", type=float, default=12.0, help="HTTP timeout per request in seconds")
+    parser.add_argument("--lock-file", default="/tmp/propertyhunter-klusvastgoed.lock", help="Lock file path to prevent concurrent scans")
+    args = parser.parse_args(argv)
+
+    if not DATABASE_SERVICE.is_enabled:
+        print("Database is not enabled. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY first.")
+        return 1
+
+    lock_path = Path(str(args.lock_file or "/tmp/propertyhunter-klusvastgoed.lock"))
+    try:
+        with _exclusive_scan_lock(lock_path):
+            result = DEAL_FINDER_ORCHESTRATOR.import_from_source(
+                "klusvastgoed",
+                {
+                    "mode": "national",
+                    "max_pages": max(1, int(args.max_pages or 1)),
+                    "timeout_seconds": float(args.timeout_seconds or 12.0),
+                    "scan_frequency_minutes": 30,
+                    "include_in_combined_ranking": False,
+                },
+            )
+    except BlockingIOError:
+        print(f"Klusvastgoed national scan is already running: {lock_path}")
+        return 0
+
+    if not result.get("ok"):
+        print(f"Klusvastgoed national scan failed: {result.get('error')}")
+        if result.get("warnings"):
+            for warning in result["warnings"][:20]:
+                print(f"- {warning}")
+        return 1
+
+    print("Klusvastgoed nationale import")
+    print(f"Listings gevonden: {result.get('listings_found')}")
+    print(f"Nieuwe listings: {result.get('new')}")
+    print(f"Gewijzigde listings: {result.get('changed')}")
+    print(f"Cities gevonden: {result.get('cities_found')}")
+    print(f"Gemeenten gevonden: {result.get('municipalities_found')}")
+    print(f"Provincies gevonden: {result.get('provinces_found')}")
+    inactive_result = result.get("inactive_result") or {}
+    if isinstance(inactive_result, dict):
+        print(f"Inactief gemarkeerd: {inactive_result.get('marked_inactive', 0)}")
+    if result.get("record_results"):
+        examples = [item for item in result["record_results"] if isinstance(item, dict) and item.get("success")][:5]
+        if examples:
+            print("Voorbeelden")
+            for item in examples:
+                print(f"- {item.get('source_url')}")
+    return 0
 
 
 def _run_url_import(urls_text: str, orchestrator: DealFinderOrchestrator | None = None) -> dict:
@@ -483,8 +575,10 @@ def _run_scan_cli(argv: list[str]) -> int:
     selection.add_argument("--source", action="append", help="Source name to scan, for example funda")
     selection.add_argument("--all", action="store_true", help="Scan all enabled portal and broker sources")
     parser.add_argument("--output-dir", default="output/scan-runs", help="Directory for temporary JSON results")
+    parser.add_argument("--municipality", help="Optional municipality for municipality-specific sources such as Klusvastgoed")
     parser.add_argument("--max-pages", type=int, default=1000, help="Maximum number of paginated result pages to crawl")
     parser.add_argument("--timeout-seconds", type=float, default=12.0, help="HTTP timeout per request in seconds")
+    parser.add_argument("--dry-run", action="store_true", help="Skip database writes and only write JSON output")
     args = parser.parse_args(argv)
 
     source_names = _resolve_scan_sources(source_names=args.source, scan_all=bool(args.all))
@@ -501,9 +595,15 @@ def _run_scan_cli(argv: list[str]) -> int:
     executed_runs: list[dict[str, Any]] = []
 
     for source_name in source_names:
+        start_url: str | None = None
+        if args.municipality and source_name.strip().lower() in {"klusvastgoed", "klusvastgoed.nl"}:
+            start_url = build_klusvastgoed_start_url(args.municipality)
+
         result = _run_source_scan(
             source_name,
+            database_service=_ReadOnlyScanDatabaseService() if args.dry_run else None,
             output_dir=Path(args.output_dir),
+            start_url=start_url,
             max_pages=max(1, int(args.max_pages or 1)),
             timeout_seconds=float(args.timeout_seconds or 12.0),
         )
@@ -528,6 +628,60 @@ def _run_scan_cli(argv: list[str]) -> int:
         print(f"Mislukt: {aggregate_failed}")
 
     return 0 if successful_runs else 1
+
+
+def _run_klusvastgoed_scan_from_ui(
+    *,
+    municipality: str,
+    max_pages: int = 1,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    selected_municipality = str(municipality or "").strip()
+    if not selected_municipality:
+        raise ValueError("Selecteer een gemeente.")
+
+    start_url = build_klusvastgoed_start_url(selected_municipality)
+    adapter = DEAL_FINDER_ORCHESTRATOR.source_registry.resolve("klusvastgoed")
+    if isinstance(adapter, KlusvastgoedAdapter):
+        start_url = adapter.build_start_url_for_municipality(selected_municipality)
+
+    database_service = _ReadOnlyScanDatabaseService() if dry_run else DatabaseService()
+    result = _run_source_scan(
+        "klusvastgoed",
+        orchestrator=DEAL_FINDER_ORCHESTRATOR,
+        database_service=database_service,
+        output_dir=Path("output") / "scan-runs",
+        start_url=start_url,
+        max_pages=max(1, int(max_pages or 1)),
+        timeout_seconds=12.0,
+        force_refresh=True,
+    )
+    if not result.get("ok"):
+        return result
+
+    rows: list[dict[str, Any]] = []
+    output_path = str(result.get("output_path") or "").strip()
+    if output_path:
+        try:
+            payload = json.loads(Path(output_path).read_text(encoding="utf-8"))
+            properties = payload.get("properties") if isinstance(payload, dict) else []
+            if isinstance(properties, list):
+                rows = _build_rows_from_scan_properties(properties)
+        except Exception as error:
+            LOGGER.warning("Klusvastgoed dry-run output could not be parsed: %s", error)
+
+    scored_rows = _score_rows_with_opportunity_intelligence(rows)
+    sorted_rows = sorted(scored_rows, key=lambda item: _safe_score(item.get("opportunity_score")) or -1, reverse=True)
+
+    return {
+        **result,
+        "source": "klusvastgoed.nl",
+        "mode": "dry-run" if dry_run else "live",
+        "municipality": selected_municipality,
+        "start_url": start_url,
+        "top_rows": sorted_rows[:20],
+        "rows_found": len(rows),
+    }
 
 
 def _run_end_to_end_cli(argv: list[str], workflow: PropertyHunterEndToEndWorkflow | None = None) -> int:
@@ -649,22 +803,39 @@ def _build_table_column_config(rows: list[dict], columns: list[tuple[str, str]])
     return config
 
 
-def _render_interactive_table(
-    rows: list[dict[str, Any]],
-    *,
-    ordered_keys: list[str],
-    column_config: dict[str, Any],
-):
-    row_count = len(rows)
-    table_height = min(680, max(220, 36 * min(row_count + 1, 18)))
-    st.dataframe(
-        rows,
-        hide_index=True,
-        width="stretch",
-        height=table_height,
-        column_order=ordered_keys,
-        column_config=column_config,
+def _render_interactive_table(rows: list[dict[str, Any]], *, columns: list[tuple[str, str]]):
+    ordered_keys = [key for _, key in columns]
+    header_cells = "".join(
+        f"<th style='text-align:left;padding:0.55rem 0.75rem;border-bottom:1px solid #d9d9d9;white-space:nowrap;background:#f6f8fb;'>{escape(str(label))}</th>"
+        for label, _ in columns
     )
+
+    body_rows: list[str] = []
+    for row in rows:
+        cells = "".join(
+            f"<td style='padding:0.5rem 0.75rem;border-bottom:1px solid #ececec;vertical-align:top;'>{escape(str(row.get(key, '')))}</td>"
+            for key in ordered_keys
+        )
+        body_rows.append(f"<tr>{cells}</tr>")
+
+    table_html = (
+        "<div style='overflow-x:auto;border:1px solid #e6e6e6;border-radius:0.75rem;'>"
+        "<table style='width:100%;border-collapse:collapse;font-size:0.92rem;'>"
+        f"<thead><tr>{header_cells}</tr></thead>"
+        f"<tbody>{''.join(body_rows)}</tbody>"
+        "</table>"
+        "</div>"
+    )
+    st.markdown(table_html, unsafe_allow_html=True)
+
+
+def _render_compact_json_section(title: str, payload: Any, *, max_chars: int = 6000):
+    st.markdown(title)
+    serialized = json.dumps(_json_safe_value(payload), ensure_ascii=False, indent=2)
+    if len(serialized) > max_chars:
+        st.caption(f"Weergegeven als afgekort JSON-overzicht ({len(serialized)} tekens)")
+        serialized = serialized[:max_chars] + "\n..."
+    st.code(serialized, language="json")
 
 
 def _render_rows_with_columns(rows: list[dict], columns: list[tuple[str, str]], empty_message: str):
@@ -682,11 +853,7 @@ def _render_rows_with_columns(rows: list[dict], columns: list[tuple[str, str]], 
             }
         )
 
-    _render_interactive_table(
-        table_rows,
-        ordered_keys=ordered_keys,
-        column_config=_build_table_column_config(table_rows, columns),
-    )
+    _render_interactive_table(table_rows, columns=columns)
 
 
 def _render_deal_candidate_cards(candidates: list[dict]):
@@ -983,6 +1150,19 @@ def _propertyhunter_listing_history_text(listing: dict[str, Any]) -> str:
     return f"status={status}"
 
 
+def _source_display_name(source_name: Any, source_url: Any = None) -> str:
+    raw_name = str(source_name or "").strip()
+    normalized_name = raw_name.lower()
+    if normalized_name in {"klusvastgoed", "klusvastgoed.nl"}:
+        return "Klusvastgoed"
+
+    raw_url = str(source_url or "").strip().lower()
+    if "klusvastgoed.nl" in raw_url:
+        return "Klusvastgoed"
+
+    return raw_name or "Onbekend"
+
+
 def _build_propertyhunter_rows(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for candidate in candidates:
@@ -1025,7 +1205,7 @@ def _build_propertyhunter_rows(candidates: list[dict[str, Any]]) -> list[dict[st
                 "source_timestamp": str(_listing_value(listing, "source_timestamp", "timestamp") or ""),
                 "investment_score": _safe_score(candidate.get("investment_score")),
                 "opportunity_score": _safe_score(candidate.get("hidden_value_score") if candidate.get("hidden_value_score") is not None else candidate.get("score")),
-                "bron": str(source.get("name") or _listing_value(listing, "source_url") or "Onbekend"),
+                "bron": _source_display_name(source.get("name"), _listing_value(listing, "source_url")),
                 "source_url": str(_listing_value(listing, "source_url") or ""),
             }
         )
@@ -1130,6 +1310,7 @@ def _load_funda_place_options() -> list[str]:
             merged.append(normalized)
 
     add_places(get_dutch_municipalities())
+    add_places(list(FUNDA_PLACE_ALIASES))
 
     # Keep defaults selectable even when municipality metadata is tijdelijk niet beschikbaar.
     add_places(list(FUNDA_DEFAULT_SCAN_CITIES))
@@ -1232,6 +1413,7 @@ def _build_rows_from_scan_properties(properties: list[dict[str, Any]]) -> list[d
                 "bag_quality_flags": value("bag_quality_flags") or [],
                 "investment_score": None,
                 "opportunity_score": None,
+                "bron": _source_display_name(value("source_name", "source"), value("source_url")),
                 "source_url": str(value("source_url") or ""),
             }
         )
@@ -1535,6 +1717,7 @@ def _run_funda_scan_from_ui(
 ) -> dict[str, Any]:
     started_at = time.perf_counter()
     per_city_results: list[dict[str, Any]] = []
+    per_city_rows: dict[str, list[dict[str, Any]]] = {}
     all_rows: list[dict[str, Any]] = []
     seen_row_keys: set[str] = set()
 
@@ -1604,6 +1787,7 @@ def _run_funda_scan_from_ui(
                     if row_key:
                         seen_row_keys.add(row_key)
                     all_rows.append(row)
+                per_city_rows[city] = city_rows
                 price_reductions += city_price_reductions
                 per_city_results.append(
                     {
@@ -1655,6 +1839,7 @@ def _run_funda_scan_from_ui(
                 if row_key:
                     seen_row_keys.add(row_key)
                 all_rows.append(row)
+            per_city_rows[city] = city_rows
             price_reductions += city_price_reductions
 
             per_city_results.append(
@@ -1689,6 +1874,12 @@ def _run_funda_scan_from_ui(
     scored_rows = _score_rows_with_opportunity_intelligence(all_rows)
     sorted_rows = sorted(scored_rows, key=lambda item: _safe_score(item.get("opportunity_score")) or -1, reverse=True)
     top_rows = sorted_rows[:20]
+    rows_by_city: dict[str, list[dict[str, Any]]] = {}
+    for row in sorted_rows:
+        city_name = str(row.get("plaats") or "Onbekend").strip() or "Onbekend"
+        city_rows = rows_by_city.setdefault(city_name, [])
+        if len(city_rows) < 20:
+            city_rows.append(row)
     duration_seconds = round(time.perf_counter() - started_at, 3)
 
     output_payload = {
@@ -1714,6 +1905,7 @@ def _run_funda_scan_from_ui(
             "failed_cities": sum(1 for item in per_city_results if not bool(item.get("ok"))),
         },
         "per_city_results": per_city_results,
+        "rows_by_city": rows_by_city,
         "top_rows": top_rows,
     }
     output_path = _write_scan_output(Path("output") / "scan-runs", output_payload)
@@ -1732,6 +1924,7 @@ def _run_funda_scan_from_ui(
         "output_path": str(output_path),
         "top_rows": top_rows,
         "per_city_results": per_city_results,
+        "rows_by_city": rows_by_city,
         "failed_cities": sum(1 for item in per_city_results if not bool(item.get("ok"))),
     }
 
@@ -1778,16 +1971,11 @@ def _render_propertyhunter_detail_page(listing_id: str):
     if isinstance(_listing_value(listing, "source_url"), str) and _listing_value(listing, "source_url").strip():
         st.link_button("Open bron", str(_listing_value(listing, "source_url")))
 
-    st.markdown("#### Candidate")
-    st.json(candidate)
-    st.markdown("#### Source")
-    st.json(source)
-    st.markdown("#### Listing")
-    st.json(listing)
-    st.markdown("#### Latest snapshot")
-    st.json(latest_snapshot)
-    st.markdown(f"#### Snapshots ({len(snapshots)})")
-    st.json(snapshots)
+    _render_compact_json_section("#### Candidate", candidate)
+    _render_compact_json_section("#### Source", source)
+    _render_compact_json_section("#### Listing", listing)
+    _render_compact_json_section("#### Latest snapshot", latest_snapshot)
+    _render_compact_json_section(f"#### Snapshots ({len(snapshots)})", snapshots[:3] if snapshots else [])
 
 
 def _render_propertyhunter_interface_page():
@@ -1877,7 +2065,7 @@ def _render_propertyhunter_interface_page():
                 "days_on_market": row.get("days_on_market") if row.get("days_on_market") is not None else "Onbekend",
                 "investment_score": row.get("investment_score") if row.get("investment_score") is not None else "Onbekend",
                 "opportunity_score": row.get("opportunity_score") if row.get("opportunity_score") is not None else "Onbekend",
-                "source_name": row.get("source_name") or "Onbekend",
+                "source_name": _source_display_name(row.get("source_name"), row.get("source_url")),
                 "source_url": row.get("source_url") or "",
             }
         )
@@ -1894,34 +2082,40 @@ def _render_propertyhunter_interface_page():
             "plaats": row.get("plaats") or "Onbekend",
             "vraagprijs": row.get("vraagprijs") or "Onbekend",
             "oppervlak": row.get("funda_woonoppervlak") or "Onbekend",
+            "bron": row.get("source_name") or "Onbekend",
             "opportunity_score": row.get("opportunity_score") or "Onbekend",
         }
         for row in table_rows[:25]
     ]
-    header_cols = st.columns(5)
+    header_cols = st.columns(6)
     header_cols[0].markdown("**Adres**")
     header_cols[1].markdown("**Plaats**")
     header_cols[2].markdown("**Vraagprijs**")
     header_cols[3].markdown("**Oppervlak**")
-    header_cols[4].markdown("**Opportunity score**")
+    header_cols[4].markdown("**Bron**")
+    header_cols[5].markdown("**Opportunity score**")
     for preview_row in preview_rows:
-        row_cols = st.columns(5)
+        row_cols = st.columns(6)
         row_cols[0].write(preview_row.get("adres") or "Onbekend")
         row_cols[1].write(preview_row.get("plaats") or "Onbekend")
         row_cols[2].write(preview_row.get("vraagprijs") or "Onbekend")
         row_cols[3].write(preview_row.get("oppervlak") or "Onbekend")
-        row_cols[4].write(preview_row.get("opportunity_score") or "Onbekend")
+        row_cols[4].write(preview_row.get("bron") or "Onbekend")
+        row_cols[5].write(preview_row.get("opportunity_score") or "Onbekend")
 
-    selected_row = st.selectbox(
+    row_options = [
+        (
+            f"{row.get('adres') or 'Onbekend'} | {row.get('plaats') or 'Onbekend'} | {row.get('vraagprijs') or 'Onbekend'} | {index + 1}",
+            row,
+        )
+        for index, row in enumerate(table_rows)
+    ]
+    selected_row_label = st.selectbox(
         "Selecteer woning",
-        options=table_rows,
-        format_func=lambda row: (
-            f"{row.get('adres') or 'Onbekend'} | "
-            f"{row.get('plaats') or 'Onbekend'} | "
-            f"{row.get('vraagprijs') or 'Onbekend'}"
-        ),
+        options=[label for label, _ in row_options],
         key="ph_interface_selected_row",
     )
+    selected_row = next((row for label, row in row_options if label == selected_row_label), None)
 
     if isinstance(selected_row, dict):
         with st.container(border=True):
@@ -1945,8 +2139,18 @@ def _render_propertyhunter_interface_page():
             st.write(f"Days on market: {selected_row.get('days_on_market')}")
             st.write(f"Investment score: {selected_row.get('investment_score')}")
             st.write(f"Opportunity score: {selected_row.get('opportunity_score')}")
+            st.write(f"Bron: {selected_row.get('source_name') or 'Onbekend'}")
             if str(selected_row.get("source_url") or "").strip():
                 st.link_button("Open bron", str(selected_row.get("source_url")))
+
+
+
+def _set_funda_scan_all_municipalities(available_places: list[str]):
+    st.session_state["deal_funda_scan_cities"] = list(available_places)
+
+
+def _clear_funda_scan_municipalities():
+    st.session_state["deal_funda_scan_cities"] = []
 
 
 def _deal_finder_marker(message: str):
@@ -3179,6 +3383,8 @@ def _render_deal_finder_page():
     available_places = _load_funda_place_options()
     if "deal_funda_scan_cities" not in st.session_state:
         st.session_state["deal_funda_scan_cities"] = [city for city in FUNDA_DEFAULT_SCAN_CITIES if city in available_places]
+    if "deal_funda_scan_custom_city" not in st.session_state:
+        st.session_state["deal_funda_scan_custom_city"] = ""
 
     scan_col_1, scan_col_2 = st.columns(2)
     with scan_col_1:
@@ -3188,22 +3394,31 @@ def _render_deal_finder_page():
             key="deal_funda_scan_cities",
             help="Typ om een Nederlandse gemeente te zoeken en selecteer er meerdere.",
         )
+        custom_city = st.text_input(
+            "Custom plaats",
+            key="deal_funda_scan_custom_city",
+            help="Voeg handmatig een plaatsnaam toe als die niet in de lijst staat.",
+            placeholder="Bijvoorbeeld: Den Haag",
+        )
 
         selection_col_1, selection_col_2 = st.columns(2)
         with selection_col_1:
-            select_all_clicked = st.button("Selecteer alle gemeenten", key="deal_funda_scan_select_all")
+            st.button(
+                "Selecteer alle gemeenten",
+                key="deal_funda_scan_select_all",
+                on_click=_set_funda_scan_all_municipalities,
+                args=(available_places,),
+            )
         with selection_col_2:
-            clear_selection_clicked = st.button("Wis selectie", key="deal_funda_scan_clear_selection")
+            st.button(
+                "Wis selectie",
+                key="deal_funda_scan_clear_selection",
+                on_click=_clear_funda_scan_municipalities,
+            )
 
-        if select_all_clicked:
-            st.session_state["deal_funda_scan_cities"] = list(available_places)
-            st.rerun()
-        if clear_selection_clicked:
-            st.session_state["deal_funda_scan_cities"] = []
-            st.rerun()
-
-        scan_cities = _merge_scan_cities([str(city) for city in selected_cities], "")
+        scan_cities = _merge_scan_cities([str(city) for city in selected_cities], str(custom_city or ""))
         st.caption(_selected_municipality_summary(scan_cities))
+        st.caption(f"Beschikbare plaatsen: {len(available_places)}")
         if len(scan_cities) > 25:
             st.warning("Een landelijke of zeer brede scan kan lang duren en veel scraperverbruik veroorzaken.")
 
@@ -3298,8 +3513,35 @@ def _render_deal_finder_page():
                 empty_message="Geen per-stad resultaten beschikbaar.",
             )
 
+        rows_by_city = latest_scan_result.get("rows_by_city") if isinstance(latest_scan_result.get("rows_by_city"), dict) else {}
+        if rows_by_city:
+            st.markdown("#### Listing preview per stad")
+            for city_name in sorted(rows_by_city.keys(), key=lambda value: value.casefold()):
+                city_rows = rows_by_city.get(city_name) or []
+                if not city_rows:
+                    continue
+                st.markdown(f"##### {city_name}")
+                _render_rows_with_columns(
+                    rows=[
+                        {
+                            "address": row.get("adres") or "Onbekend",
+                            "asking_price": _format_currency(row.get("vraagprijs")),
+                            "living_area": _format_number(row.get("woonoppervlak")),
+                            "opportunity_score": _safe_score(row.get("opportunity_score")) if _safe_score(row.get("opportunity_score")) is not None else "Onbekend",
+                        }
+                        for row in city_rows[:10]
+                    ],
+                    columns=[
+                        ("Adres", "address"),
+                        ("Vraagprijs", "asking_price"),
+                        ("Woonoppervlak", "living_area"),
+                        ("Opportunity score", "opportunity_score"),
+                    ],
+                    empty_message="Geen listings beschikbaar voor deze stad.",
+                )
+
         top_rows = latest_scan_result.get("top_rows") if isinstance(latest_scan_result.get("top_rows"), list) else []
-        st.markdown("#### Top 20 op opportunity score")
+        st.markdown("#### Gecombineerde ranking over alle geselecteerde steden")
         if not top_rows:
             st.info("Geen resultaten beschikbaar voor de geselecteerde scaninstellingen.")
         else:
@@ -3427,6 +3669,7 @@ def _render_deal_finder_page():
                 "investment_score": row.get("investment_score") if row.get("investment_score") is not None else "Onbekend",
                 "opportunity_score": row.get("opportunity_score") if row.get("opportunity_score") is not None else "Onbekend",
                 "recommendation": row.get("investment_recommendation") or "★ Avoid",
+                "source": row.get("bron") or _source_display_name(None, row.get("source_url")),
                 "source_timestamp": row.get("source_timestamp") or "Onbekend",
                 "source_url": row.get("source_url") or "",
             }
@@ -3471,6 +3714,7 @@ def _render_deal_finder_page():
             ("Investment score", "investment_score"),
             ("Opportunity score", "opportunity_score"),
             ("Investeringsadvies", "recommendation"),
+            ("Bron", "source"),
             ("Bron timestamp", "source_timestamp"),
             ("Bron URL", "source_url"),
         ],
@@ -3831,6 +4075,8 @@ def main():
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "scan":
         raise SystemExit(_run_scan_cli(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "klusvastgoed-national":
+        raise SystemExit(_run_klusvastgoed_national_cli(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "run":
         raise SystemExit(_run_end_to_end_cli(sys.argv[2:]))
     main()

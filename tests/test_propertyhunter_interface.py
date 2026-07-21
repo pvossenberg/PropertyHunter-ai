@@ -141,6 +141,26 @@ class PropertyHunterInterfaceHelpersTests(unittest.TestCase):
         self.assertEqual(row["perceel"], 164.0)
         self.assertEqual(row["slaapkamers"], 4)
 
+    def test_build_rows_from_scan_properties_formats_klusvastgoed_source_name(self):
+        properties = [
+            {
+                "property": {
+                    "address": "Nystadstraat 11",
+                    "city": "Rotterdam",
+                    "source_name": "klusvastgoed.nl",
+                    "source_url": "https://www.klusvastgoed.nl/koop/rotterdam/nystadstraat-11",
+                    "raw_payload": {
+                        "living_area": 106,
+                    },
+                }
+            }
+        ]
+
+        rows = _build_rows_from_scan_properties(properties)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["bron"], "Klusvastgoed")
+
     def test_opportunity_scoring_is_clamped_and_prefers_better_candidate(self):
         rows = [
             {
