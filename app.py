@@ -1193,6 +1193,7 @@ def _build_propertyhunter_rows(candidates: list[dict[str, Any]]) -> list[dict[st
                 "bouwjaar": _safe_score(_listing_value(listing, "construction_year", "bag_building_year")),
                 "price_per_m2": _safe_number(_listing_value(listing, "asking_price_per_m2", "price_per_m2")),
                 "asking_price_per_m2": _safe_number(_listing_value(listing, "asking_price_per_m2", "price_per_m2")),
+                "neighborhood_price_per_m2": _safe_number(_listing_value(listing, "neighborhood_m2_price_average", "neighbourhood_m2_price_average", "neighborhood_price_per_m2")),
                 "woz_per_m2": _safe_number(_listing_value(listing, "woz_value_per_m2")),
                 "bag_usage_purpose": str(_listing_value(listing, "bag_usage_purpose") or ""),
                 "bag_bouwjaar": _safe_score(_listing_value(listing, "bag_building_year")),
@@ -1406,6 +1407,7 @@ def _build_rows_from_scan_properties(properties: list[dict[str, Any]]) -> list[d
                 "source_timestamp": str(value("source_timestamp", "timestamp") or ""),
                 "price_per_m2": _safe_number(value("asking_price_per_m2", "price_per_m2")),
                 "asking_price_per_m2": _safe_number(value("asking_price_per_m2", "price_per_m2")),
+                "neighborhood_price_per_m2": _safe_number(value("neighborhood_m2_price_average", "neighbourhood_m2_price_average", "neighborhood_price_per_m2")),
                 "woz_per_m2": _safe_number(value("woz_value_per_m2")),
                 "bag_usage_purpose": str(value("bag_usage_purpose") or ""),
                 "bag_bouwjaar": _safe_score(value("bag_building_year")),
@@ -1474,6 +1476,43 @@ def _compute_row_price_per_m2(row: dict[str, Any]) -> float | None:
     return round(price / living_area, 2)
 
 
+def _compute_market_discount_ratio(*, asking_price_per_m2: float | None, neighborhood_price_per_m2: float | None) -> float | None:
+    if asking_price_per_m2 is None:
+        return None
+    if neighborhood_price_per_m2 in (None, 0):
+        return None
+    return (float(neighborhood_price_per_m2) - float(asking_price_per_m2)) / float(neighborhood_price_per_m2)
+
+
+def _market_discount_score(discount_ratio: float | None) -> int | None:
+    if discount_ratio is None:
+        return None
+    # 0% discount -> 0, 100% discount -> 100; negative discounts are clamped to 0.
+    return max(0, min(100, int(round(float(discount_ratio) * 100.0))))
+
+
+def _enrich_market_discount_metrics(row: dict[str, Any]) -> dict[str, Any]:
+    asking_ppm2 = _compute_row_price_per_m2(row)
+    neighborhood_ppm2 = _safe_number(
+        row.get("neighborhood_price_per_m2")
+        or row.get("neighborhood_m2_price_average")
+        or row.get("neighbourhood_m2_price_average")
+    )
+    discount_ratio = _compute_market_discount_ratio(
+        asking_price_per_m2=asking_ppm2,
+        neighborhood_price_per_m2=neighborhood_ppm2,
+    )
+    return {
+        **row,
+        "asking_price_per_m2": asking_ppm2,
+        "price_per_m2": asking_ppm2,
+        "neighborhood_price_per_m2": neighborhood_ppm2,
+        "discount_percentage": round(discount_ratio * 100.0, 2) if discount_ratio is not None else None,
+        "market_discount_score": _market_discount_score(discount_ratio),
+        "is_market_discount_highlight": bool(discount_ratio is not None and discount_ratio >= 0.25),
+    }
+
+
 def _score_rows_with_opportunity_intelligence(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not rows:
         return []
@@ -1509,6 +1548,20 @@ def _score_rows_with_opportunity_intelligence(rows: list[dict[str, Any]]) -> lis
             row_reductions = _safe_score(row.get("price_reduction_count")) or 0
             row_ppm2 = _compute_row_price_per_m2(row)
             row["price_per_m2"] = row_ppm2
+            row["asking_price_per_m2"] = row_ppm2
+            neighborhood_ppm2 = _safe_number(
+                row.get("neighborhood_price_per_m2")
+                or row.get("neighborhood_m2_price_average")
+                or row.get("neighbourhood_m2_price_average")
+            )
+            row["neighborhood_price_per_m2"] = neighborhood_ppm2
+            discount_ratio = _compute_market_discount_ratio(
+                asking_price_per_m2=row_ppm2,
+                neighborhood_price_per_m2=neighborhood_ppm2,
+            )
+            row["discount_percentage"] = round(discount_ratio * 100.0, 2) if discount_ratio is not None else None
+            row["market_discount_score"] = _market_discount_score(discount_ratio)
+            row["is_market_discount_highlight"] = bool(discount_ratio is not None and discount_ratio >= 0.25)
             row["city_avg_price_per_m2"] = round(avg_ppm2, 2) if avg_ppm2 is not None else None
             row["difference_vs_city_avg_pct"] = None
             if row_ppm2 is not None and avg_ppm2 is not None and avg_ppm2 > 0:
@@ -2028,9 +2081,11 @@ def _render_propertyhunter_interface_page():
     with filter_col_3:
         min_opportunity_score = st.slider("Minimale opportunity score", min_value=0, max_value=100, value=0, key="dashboard_filter_min_opportunity")
 
+    enriched_rows = [_enrich_market_discount_metrics(dict(row)) for row in rows]
+
     filtered_rows = [
         row
-        for row in rows
+        for row in enriched_rows
         if (selected_place == "Alle plaatsen" or str(row.get("city") or "").strip() == selected_place)
         and (_safe_number(row.get("asking_price")) is not None and _safe_number(row.get("asking_price")) >= float(min_price))
         and (_safe_number(row.get("asking_price")) is not None and _safe_number(row.get("asking_price")) <= float(max_price))
@@ -2038,7 +2093,13 @@ def _render_propertyhunter_interface_page():
         and (_safe_score(row.get("opportunity_score")) is not None and _safe_score(row.get("opportunity_score")) >= int(min_opportunity_score))
     ]
 
-    filtered_rows.sort(key=lambda item: int(_safe_score(item.get("opportunity_score")) or -1), reverse=True)
+    filtered_rows.sort(
+        key=lambda item: (
+            _safe_number(item.get("discount_percentage")) if _safe_number(item.get("discount_percentage")) is not None else -9999.0,
+            int(_safe_score(item.get("opportunity_score")) or -1),
+        ),
+        reverse=True,
+    )
 
     table_rows = []
     for row in filtered_rows:
@@ -2052,7 +2113,11 @@ def _render_propertyhunter_interface_page():
                 "bag_oppervlak": _format_number(row.get("bag_official_floor_area_m2")) if row.get("bag_official_floor_area_m2") is not None else "Niet beschikbaar",
                 "gebruikt_rekenoppervlak": _format_number(row.get("calculation_area_m2")) if row.get("calculation_area_m2") is not None else "Niet beschikbaar",
                 "bron_rekenoppervlak": row.get("calculation_area_source") or "Niet beschikbaar",
-                "vraagprijs_per_m2": _format_currency(row.get("asking_price_per_m2")) if row.get("asking_price_per_m2") is not None else "Niet beschikbaar",
+                "asking_eur_m2": _format_currency(row.get("asking_price_per_m2")) if row.get("asking_price_per_m2") is not None else "Niet beschikbaar",
+                "neighborhood_eur_m2": _format_currency(row.get("neighborhood_price_per_m2")) if row.get("neighborhood_price_per_m2") is not None else "Niet beschikbaar",
+                "discount_pct": _format_percentage(_safe_number(row.get("discount_percentage")), decimals=2) if _safe_number(row.get("discount_percentage")) is not None else "Niet beschikbaar",
+                "market_discount_score": row.get("market_discount_score") if row.get("market_discount_score") is not None else "Onbekend",
+                "discount_highlight": "JA (>=25%)" if bool(row.get("is_market_discount_highlight")) else "Nee",
                 "woz_per_m2": _format_currency(row.get("woz_value_per_m2")) if row.get("woz_value_per_m2") is not None else "Niet beschikbaar",
                 "funda_bag_verschil_m2": _format_number(row.get("living_area_difference_m2")) if row.get("living_area_difference_m2") is not None else "Niet beschikbaar",
                 "funda_bag_verschil_pct": _format_percentage(_safe_number(row.get("living_area_difference_percentage")), decimals=2) if _safe_number(row.get("living_area_difference_percentage")) is not None else "Niet beschikbaar",
@@ -2078,34 +2143,43 @@ def _render_propertyhunter_interface_page():
     st.caption("Overzicht (eerste 25 resultaten)")
     preview_rows = [
         {
-            "adres": row.get("adres") or "Onbekend",
+            "adres": ("🔥 " if str(row.get("discount_highlight") or "").startswith("JA") else "") + (row.get("adres") or "Onbekend"),
             "plaats": row.get("plaats") or "Onbekend",
             "vraagprijs": row.get("vraagprijs") or "Onbekend",
-            "oppervlak": row.get("funda_woonoppervlak") or "Onbekend",
+            "asking_eur_m2": row.get("asking_eur_m2") or "Onbekend",
+            "neighborhood_eur_m2": row.get("neighborhood_eur_m2") or "Onbekend",
+            "discount_pct": row.get("discount_pct") or "Onbekend",
+            "market_discount_score": row.get("market_discount_score") or "Onbekend",
             "bron": row.get("source_name") or "Onbekend",
-            "opportunity_score": row.get("opportunity_score") or "Onbekend",
+            "highlight": row.get("discount_highlight") or "Nee",
         }
         for row in table_rows[:25]
     ]
-    header_cols = st.columns(6)
+    header_cols = st.columns(9)
     header_cols[0].markdown("**Adres**")
     header_cols[1].markdown("**Plaats**")
     header_cols[2].markdown("**Vraagprijs**")
-    header_cols[3].markdown("**Oppervlak**")
-    header_cols[4].markdown("**Bron**")
-    header_cols[5].markdown("**Opportunity score**")
+    header_cols[3].markdown("**Asking €/m²**")
+    header_cols[4].markdown("**Neighbourhood €/m²**")
+    header_cols[5].markdown("**Discount %**")
+    header_cols[6].markdown("**Market Discount Score**")
+    header_cols[7].markdown("**Bron**")
+    header_cols[8].markdown("**Highlight**")
     for preview_row in preview_rows:
-        row_cols = st.columns(6)
+        row_cols = st.columns(9)
         row_cols[0].write(preview_row.get("adres") or "Onbekend")
         row_cols[1].write(preview_row.get("plaats") or "Onbekend")
         row_cols[2].write(preview_row.get("vraagprijs") or "Onbekend")
-        row_cols[3].write(preview_row.get("oppervlak") or "Onbekend")
-        row_cols[4].write(preview_row.get("bron") or "Onbekend")
-        row_cols[5].write(preview_row.get("opportunity_score") or "Onbekend")
+        row_cols[3].write(preview_row.get("asking_eur_m2") or "Onbekend")
+        row_cols[4].write(preview_row.get("neighborhood_eur_m2") or "Onbekend")
+        row_cols[5].write(preview_row.get("discount_pct") or "Onbekend")
+        row_cols[6].write(preview_row.get("market_discount_score") or "Onbekend")
+        row_cols[7].write(preview_row.get("bron") or "Onbekend")
+        row_cols[8].write(preview_row.get("highlight") or "Nee")
 
     row_options = [
         (
-            f"{row.get('adres') or 'Onbekend'} | {row.get('plaats') or 'Onbekend'} | {row.get('vraagprijs') or 'Onbekend'} | {index + 1}",
+            f"{'🔥 ' if str(row.get('discount_highlight') or '').startswith('JA') else ''}{row.get('adres') or 'Onbekend'} | {row.get('plaats') or 'Onbekend'} | {row.get('vraagprijs') or 'Onbekend'} | {index + 1}",
             row,
         )
         for index, row in enumerate(table_rows)
@@ -2126,7 +2200,11 @@ def _render_propertyhunter_interface_page():
             st.write(f"BAG-oppervlak: {selected_row.get('bag_oppervlak')} m²")
             st.write(f"Gebruikt rekenoppervlak: {selected_row.get('gebruikt_rekenoppervlak')} m²")
             st.write(f"Bron rekenoppervlak: {selected_row.get('bron_rekenoppervlak')}")
-            st.write(f"Vraagprijs per m²: {selected_row.get('vraagprijs_per_m2')}")
+            st.write(f"Asking €/m²: {selected_row.get('asking_eur_m2')}")
+            st.write(f"Neighbourhood €/m²: {selected_row.get('neighborhood_eur_m2')}")
+            st.write(f"Discount %: {selected_row.get('discount_pct')}")
+            st.write(f"Market Discount Score: {selected_row.get('market_discount_score')}")
+            st.write(f"Discount highlight: {selected_row.get('discount_highlight')}")
             st.write(f"WOZ per m²: {selected_row.get('woz_per_m2')}")
             st.write(f"Verschil Funda/BAG m²: {selected_row.get('funda_bag_verschil_m2')}")
             st.write(f"Verschil Funda/BAG %: {selected_row.get('funda_bag_verschil_pct')}")

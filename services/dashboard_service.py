@@ -109,6 +109,7 @@ class DashboardPropertyRow:
     living_area_difference_m2: float | None = None
     living_area_difference_percentage: float | None = None
     asking_price_per_m2: float | None = None
+    neighborhood_price_per_m2: float | None = None
     woz_value_per_m2: float | None = None
     bag_confidence_score: int | None = None
     bag_quality_flags: list[str] = field(default_factory=list)
@@ -149,6 +150,7 @@ class DashboardPropertyRow:
             "living_area_difference_m2": self.living_area_difference_m2,
             "living_area_difference_percentage": self.living_area_difference_percentage,
             "asking_price_per_m2": self.asking_price_per_m2,
+            "neighborhood_price_per_m2": self.neighborhood_price_per_m2,
             "woz_value_per_m2": self.woz_value_per_m2,
             "bag_confidence_score": self.bag_confidence_score,
             "bag_quality_flags": list(self.bag_quality_flags),
@@ -350,6 +352,11 @@ class DashboardService:
             living_area_difference_m2=_as_float(payload.get("living_area_difference_m2")),
             living_area_difference_percentage=_as_float(payload.get("living_area_difference_percentage")),
             asking_price_per_m2=_as_float(payload.get("asking_price_per_m2") or payload.get("price_per_m2")),
+            neighborhood_price_per_m2=_as_float(
+                payload.get("neighborhood_m2_price_average")
+                or payload.get("neighbourhood_m2_price_average")
+                or payload.get("neighborhood_price_per_m2")
+            ),
             woz_value_per_m2=_as_float(payload.get("woz_value_per_m2")),
             bag_confidence_score=_as_int(payload.get("bag_confidence_score")),
             bag_quality_flags=[str(item) for item in _as_list(payload.get("bag_quality_flags")) if str(item).strip()],
@@ -411,6 +418,11 @@ class DashboardService:
             living_area_difference_m2=_as_float(payload.get("living_area_difference_m2")),
             living_area_difference_percentage=_as_float(payload.get("living_area_difference_percentage")),
             asking_price_per_m2=_as_float(payload.get("asking_price_per_m2") or payload.get("price_per_m2")),
+            neighborhood_price_per_m2=_as_float(
+                payload.get("neighborhood_m2_price_average")
+                or payload.get("neighbourhood_m2_price_average")
+                or payload.get("neighborhood_price_per_m2")
+            ),
             woz_value_per_m2=_as_float(payload.get("woz_value_per_m2")),
             bag_confidence_score=_as_int(payload.get("bag_confidence_score")),
             bag_quality_flags=[str(item) for item in _as_list(payload.get("bag_quality_flags")) if str(item).strip()],

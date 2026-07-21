@@ -89,6 +89,11 @@ class PropertyHunterInterfaceHelpersTests(unittest.TestCase):
         self.assertIn("renovation_potential", first)
         self.assertIn("overall_investment_score", first)
         self.assertIn("investment_recommendation", first)
+        self.assertIn("asking_price_per_m2", first)
+        self.assertIn("neighborhood_price_per_m2", first)
+        self.assertIn("discount_percentage", first)
+        self.assertIn("market_discount_score", first)
+        self.assertIn("is_market_discount_highlight", first)
 
         self.assertGreaterEqual(first["split_potential"], 0)
         self.assertLessEqual(first["split_potential"], 100)
@@ -98,6 +103,33 @@ class PropertyHunterInterfaceHelpersTests(unittest.TestCase):
         self.assertLessEqual(first["rental_potential"], 100)
         self.assertGreaterEqual(first["renovation_potential"], 0)
         self.assertLessEqual(first["renovation_potential"], 100)
+
+    def test_market_discount_metrics_follow_required_formula_and_highlight_threshold(self):
+        rows = [
+            {
+                "adres": "Kortingstraat 25",
+                "plaats": "Rotterdam",
+                "vraagprijs": 300000,
+                "woonoppervlak": 100,
+                "neighborhood_price_per_m2": 4000,
+                "energielabel": "B",
+                "bouwjaar": 1995,
+                "slaapkamers": 3,
+                "price_reduction_count": 0,
+                "investment_score": None,
+                "opportunity_score": None,
+            }
+        ]
+
+        scored = _score_rows_with_opportunity_intelligence(rows)
+
+        self.assertEqual(len(scored), 1)
+        row = scored[0]
+        self.assertEqual(row["asking_price_per_m2"], 3000.0)
+        self.assertEqual(row["neighborhood_price_per_m2"], 4000.0)
+        self.assertEqual(row["discount_percentage"], 25.0)
+        self.assertEqual(row["market_discount_score"], 25)
+        self.assertTrue(row["is_market_discount_highlight"])
 
     def test_sort_deal_intelligence_rows_by_new_scores(self):
         rows = [
@@ -222,6 +254,7 @@ class PropertyHunterInterfaceHelpersTests(unittest.TestCase):
                         "bedrooms": 3,
                         "energy_label": "A",
                         "construction_year": 1998,
+                        "neighborhood_m2_price_average": 6200,
                     },
                 },
                 "source": {"name": "funda.nl"},
@@ -245,6 +278,7 @@ class PropertyHunterInterfaceHelpersTests(unittest.TestCase):
         self.assertEqual(row["investment_score"], 78)
         self.assertEqual(row["opportunity_score"], 84)
         self.assertEqual(row["bron"], "funda.nl")
+        self.assertEqual(row["neighborhood_price_per_m2"], 6200.0)
 
     def test_filter_rows_applies_all_filter_dimensions(self):
         rows = [
